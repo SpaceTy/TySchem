@@ -101,6 +101,47 @@ const API = {
     if (!r.ok) throw new Error('not found');
     return r.json();
   },
+  // Projects group schematics into an ordered, many-to-many set.
+  async listProjects(params = {}) {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== '' && v !== null && v !== undefined) q.set(k, v);
+    }
+    const r = await fetch('/api/projects?' + q);
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  },
+  async getProject(id) {
+    const r = await fetch('/api/projects/' + encodeURIComponent(id));
+    if (!r.ok) throw new Error('not found');
+    return r.json();
+  },
+  async createProject(body) {
+    return projectRequest('/api/projects', { method: 'POST', body });
+  },
+  async updateProject(id, body) {
+    return projectRequest('/api/projects/' + encodeURIComponent(id), { method: 'PUT', body });
+  },
+  async deleteProject(id) {
+    const r = await fetch('/api/projects/' + encodeURIComponent(id), { method: 'DELETE' });
+    if (r.status === 401 || r.status === 403) { onUnauthorized(); throw new Error('not allowed'); }
+    if (!r.ok) throw new Error('delete failed');
+  },
+  async addProjectSchematic(id, schematicId) {
+    return projectRequest('/api/projects/' + encodeURIComponent(id) + '/schematics', {
+      method: 'POST', body: { schematicId },
+    });
+  },
+  async removeProjectSchematic(id, schematicId) {
+    return projectRequest('/api/projects/' + encodeURIComponent(id) + '/schematics/' + encodeURIComponent(schematicId), {
+      method: 'DELETE',
+    });
+  },
+  async setProjectSchematics(id, schematicIds) {
+    return projectRequest('/api/projects/' + encodeURIComponent(id) + '/schematics', {
+      method: 'PUT', body: { schematicIds },
+    });
+  },
   // Admin-only account management.
   async adminUsers() {
     const r = await fetch('/api/admin/users');
@@ -127,6 +168,20 @@ const API = {
     }
   },
 };
+
+// Shared fetch for project mutations: JSON in/out, auth failures mapped.
+async function projectRequest(url, { method = 'GET', body } = {}) {
+  const r = await fetch(url, {
+    method,
+    headers: body !== undefined ? { 'Content-Type': 'application/json' } : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  if (r.status === 401 || r.status === 403) { onUnauthorized(); throw new Error('not allowed'); }
+  if (r.status === 204) return null;
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || 'request failed');
+  return data;
+}
 
 // Shared fetch for rating/like actions: maps auth failures to sign-in prompts.
 async function feedbackRequest(url, options) {
@@ -649,6 +704,27 @@ function setViewCleanup(fn) {
   _viewCleanup = fn;
 }
 
+// Context chip under the nav; aligned beneath whichever section is active.
+function positionNavSub() {
+  const navSub = document.getElementById('nav-sub');
+  const active = document.querySelector('.site-nav .nav-link.active');
+  if (navSub && active) navSub.style.left = active.offsetLeft + 'px';
+}
+
+function showNavSub(text) {
+  const navSub = document.getElementById('nav-sub');
+  if (!navSub) return;
+  const navSubText = document.getElementById('nav-sub-text');
+  if (navSubText) navSubText.textContent = text;
+  navSub.hidden = false;
+  positionNavSub();
+}
+
+window.addEventListener('resize', () => {
+  const navSub = document.getElementById('nav-sub');
+  if (navSub && !navSub.hidden) positionNavSub();
+});
+
 function route() {
   if (_currentAbort) _currentAbort.abort();
   _currentAbort = new AbortController();
@@ -656,6 +732,7 @@ function route() {
   $view.classList.remove('view-wide');
   document.body.classList.remove('detail-view');
   document.body.classList.remove('profile-page');
+  document.body.classList.remove('project-page');
   const navSub = document.getElementById('nav-sub');
   if (navSub) { navSub.hidden = true; }
   const navSubText = document.getElementById('nav-sub-text');
@@ -668,6 +745,7 @@ function route() {
   document.querySelectorAll('.nav-link').forEach(a => a.classList.remove('active'));
   if (parts[0] === 'upload') document.querySelector('[data-nav="upload"]')?.classList.add('active');
   else if (parts[0] === 'mine') document.querySelector('[data-nav="mine"]')?.classList.add('active');
+  else if (parts[0] === 'projects' || parts[0] === 'project') document.querySelector('[data-nav="projects"]')?.classList.add('active');
   else if (parts[0] !== 'login' && parts[0] !== 'register') document.querySelector('[data-nav="schematics"]')?.classList.add('active');
 
   if (parts.length === 0 || (parts.length === 1 && parts[0] === '')) { renderList({ owner: '' }); return; }
@@ -676,6 +754,8 @@ function route() {
   if (parts[0] === 'upload') { renderUpload(); return; }
   if (parts[0] === 'schematic' && parts[1]) { renderDetail(parts[1]); return; }
   if (parts[0] === 'user' && parts[1]) { renderProfile(decodeURIComponent(parts.slice(1).join('/'))); return; }
+  if (parts[0] === 'projects') { renderProjects(); return; }
+  if (parts[0] === 'project' && parts[1]) { renderProject(decodeURIComponent(parts.slice(1).join('/'))); return; }
   if (parts[0] === 'admin') { renderAdmin(); return; }
   $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Not found</h2></div>';
 }
@@ -1117,7 +1197,7 @@ function renderListBody() {
 // ───────────────────────────────────────────────────────────────
 //  Upload / create view
 // ───────────────────────────────────────────────────────────────
-function renderUpload() {
+async function renderUpload() {
   if (!currentUser) {
     $view.innerHTML = `
       <div class="fade-in">
@@ -1159,6 +1239,13 @@ function renderUpload() {
                 <div class="form-group">
                   <label class="label" for="upload-desc">Description</label>
                   <textarea class="textarea" id="upload-desc" placeholder="Optional description of the schematic..." maxlength="5000"></textarea>
+                </div>
+              </div>
+              <div class="upload-field">
+                <div class="form-group">
+                  <label class="label">Add to projects</label>
+                  <div class="add-schem-list upload-projects" id="upload-projects"><span class="form-hint">Loading your projects...</span></div>
+                  <div class="form-hint">Optional. You can also add this schematic to projects later.</div>
                 </div>
               </div>
             </div>
@@ -1204,6 +1291,18 @@ function renderUpload() {
   form.addEventListener('dragleave', () => form.classList.remove('drag-over'));
   form.addEventListener('drop', e => { e.preventDefault(); form.classList.remove('drag-over'); if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
 
+  API.listProjects({ owner: 'me', limit: 200 }).then(data => {
+    const el = document.getElementById('upload-projects');
+    if (!el) return;
+    const projects = data.items || [];
+    el.innerHTML = projects.length
+      ? projects.map(p => `<label class="add-schem-item"><input type="checkbox" value="${p.id}" /> <span>${esc(p.name)}</span></label>`).join('')
+      : '<span class="form-hint">You have no projects yet. <a href="#/projects">Create one</a>.</span>';
+  }).catch(() => {
+    const el = document.getElementById('upload-projects');
+    if (el) el.innerHTML = '<span class="form-hint">Could not load projects.</span>';
+  });
+
   form.addEventListener('submit', async e => {
     e.preventDefault();
     if (!chosenFile) return;
@@ -1214,6 +1313,7 @@ function renderUpload() {
     document.getElementById('upload-progress-wrap').style.display = '';
     const bar = document.getElementById('upload-bar');
 
+    const projectIds = Array.from(document.querySelectorAll('#upload-projects input:checked')).map(i => i.value);
     const fd = new FormData();
     fd.append('file', chosenFile);
     fd.append('name', document.getElementById('upload-name').value.trim());
@@ -1221,6 +1321,9 @@ function renderUpload() {
 
     try {
       const meta = await API.upload(fd, p => { bar.style.width = Math.round(p * 100) + '%'; });
+      for (const pid of projectIds) {
+        try { await API.addProjectSchematic(pid, meta.id); } catch {}
+      }
       toast('Schematic uploaded');
       location.hash = '#/schematic/' + meta.id;
     } catch (err) {
@@ -1250,16 +1353,12 @@ async function renderDetail(id) {
 
   $view.classList.add('view-wide');
   document.body.classList.add('detail-view');
-  const navSub = document.getElementById('nav-sub');
-  if (navSub) {
-    const navSubText = document.getElementById('nav-sub-text');
-    if (navSubText) navSubText.textContent = meta.name;
-    navSub.hidden = false;
-  }
+  showNavSub(meta.name);
   $view.innerHTML = `
     <div class="fade-in detail-layout">
       <div class="panel detail-info">
         <h2 class="page-title detail-name">${esc(meta.name)}</h2>
+        ${meta.projects && meta.projects.length ? `<div class="detail-projects">${meta.projects.map(pr => `<a class="project-chip" href="#/project/${pr.id}">&#128193; ${esc(pr.name)}</a>`).join('')}</div>` : ''}
         ${meta.description ? '<p class="detail-description">' + esc(meta.description) + '</p>' : ''}
         <div class="rating-widget" id="detail-rating">
           <div class="stars" role="group" aria-label="Rate this schematic">${ratingStarsHtml(meta, true)}</div>
@@ -1411,6 +1510,342 @@ function openEditPopover(anchor, meta, id) {
     }
   });
   pop.querySelector('#pop-edit-name')?.focus();
+}
+
+// ───────────────────────────────────────────────────────────────
+//  Projects
+// ───────────────────────────────────────────────────────────────
+function projectCardHtml(p) {
+  return `
+    <a class="project-card" href="#/project/${p.id}">
+      <div class="project-card-head">
+        <span class="project-card-icon">&#128193;</span>
+        <div class="project-card-title">
+          <div class="project-card-name">${esc(p.name)}</div>
+          <div class="project-card-owner">${esc(p.ownerName || 'anonymous')}</div>
+        </div>
+      </div>
+      ${p.description ? `<p class="project-card-desc">${esc(p.description)}</p>` : ''}
+      <div class="project-card-meta">
+        <span>${p.schematicCount} schematic${p.schematicCount === 1 ? '' : 's'}</span>
+        <span>${fmtDate(p.createdAt)}</span>
+      </div>
+    </a>`;
+}
+
+async function renderProjects() {
+  $view.classList.add('view-wide');
+  $view.innerHTML = `
+    <div class="browse-view">
+      <div class="projects-head">
+        <h2 class="page-title">Projects</h2>
+        ${currentUser ? '<button type="button" class="button button-primary button-sm" id="new-project-btn">New project</button>' : ''}
+      </div>
+      <div id="projects-body" class="fade-in"><div class="empty-state panel"><p class="empty-text">Loading...</p></div></div>
+    </div>`;
+
+  document.getElementById('new-project-btn')?.addEventListener('click', e => {
+    const btn = e.currentTarget;
+    if (btn.__popover) { btn.__popover.close(); return; }
+    openProjectCreatePopover(btn);
+  });
+
+  let data;
+  try { data = await API.listProjects({ limit: 100 }); } catch {
+    const body = document.getElementById('projects-body');
+    if (!body) return;
+    body.innerHTML = '<div class="empty-state panel"><p class="empty-text" style="color:#ef4444">Failed to load projects.</p></div>';
+    return;
+  }
+  const body = document.getElementById('projects-body');
+  if (!body) return;
+  const items = data.items || [];
+  body.innerHTML = items.length
+    ? `<div class="projects-grid">${items.map(projectCardHtml).join('')}</div>`
+    : `<div class="empty-state panel">
+         <div class="empty-icon">&#128193;</div>
+         <p class="empty-text">No projects yet.</p>
+         ${currentUser ? '<p class="empty-hint">Create a project to group your schematics.</p>' : ''}
+       </div>`;
+}
+
+function openProjectCreatePopover(anchor) {
+  const { pop, close } = createPopover(anchor, `
+    <h3 class="dialog-title">New Project</h3>
+    <form id="project-create-form" autocomplete="off">
+      <div class="form-group">
+        <label class="label" for="pop-project-name">Name</label>
+        <input class="input" id="pop-project-name" maxlength="200" required />
+      </div>
+      <div class="form-group">
+        <label class="label" for="pop-project-desc">Description</label>
+        <textarea class="textarea" id="pop-project-desc" maxlength="5000" placeholder="What is this project about?"></textarea>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" class="button button-secondary" data-act="cancel">Cancel</button>
+        <button type="submit" class="button button-primary" data-act="save">Create</button>
+      </div>
+    </form>`);
+
+  pop.querySelector('[data-act="cancel"]').addEventListener('click', close);
+  pop.querySelector('#project-create-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const btn = pop.querySelector('[data-act="save"]');
+    btn.disabled = true;
+    btn.textContent = 'Creating...';
+    try {
+      const created = await API.createProject({
+        name: pop.querySelector('#pop-project-name').value.trim(),
+        description: pop.querySelector('#pop-project-desc').value.trim(),
+      });
+      toast('Project created');
+      close();
+      location.hash = '#/project/' + created.id;
+    } catch (err) {
+      toast(err.message || 'Failed to create project', 'error');
+      btn.disabled = false;
+      btn.textContent = 'Create';
+    }
+  });
+  pop.querySelector('#pop-project-name')?.focus();
+}
+
+async function renderProject(id) {
+  $view.innerHTML = '<div class="panel fade-in"><div class="empty-state"><p class="empty-text">Loading...</p></div></div>';
+
+  let detail;
+  try { detail = await API.getProject(id); } catch {
+    $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Project not found</h2><a href="#/projects" class="button button-secondary">Back to projects</a></div>';
+    return;
+  }
+
+  const p = detail.project;
+  const items = detail.schematics || [];
+  const owner = !!currentUser && (currentUser.isAdmin || !p.ownerId || p.ownerId === currentUser.id);
+
+  $view.classList.add('view-wide');
+  document.body.classList.add('project-page');
+  showNavSub(p.name);
+  $view.innerHTML = `
+    <div class="fade-in project-view">
+      <div class="panel project-header">
+        <div class="project-header-main">
+          <div class="project-header-title">
+            <span class="project-header-icon">&#128193;</span>
+            <div>
+              <h2 class="page-title project-name">${esc(p.name)}</h2>
+              <p class="project-meta">
+                ${p.ownerName ? `<a class="owner-link" href="#/user/${encodeURIComponent(p.ownerName)}">${esc(p.ownerName)}</a>` : 'anonymous'}
+                &middot; <span id="project-count">${items.length} schematic${items.length === 1 ? '' : 's'}</span>
+                &middot; created ${fmtDate(p.createdAt)}
+              </p>
+            </div>
+          </div>
+          ${p.description ? `<p class="project-description">${esc(p.description)}</p>` : ''}
+        </div>
+        ${owner ? `<div class="project-header-actions">
+          <button type="button" class="button button-secondary button-sm" id="project-edit">Edit</button>
+          <button type="button" class="button button-danger button-sm" id="project-delete">Delete</button>
+        </div>` : ''}
+      </div>
+      <section class="project-schematics">
+        <div class="project-section-head">
+          <h3 class="project-section-title">Schematics</h3>
+          ${owner ? '<button type="button" class="button button-secondary button-sm" id="project-add">Add schematics</button>' : ''}
+        </div>
+        <div id="project-grid" class="schematics-grid"></div>
+      </section>
+    </div>`;
+
+  renderProjectSchematics(items, owner, id);
+
+  document.getElementById('project-edit')?.addEventListener('click', e => {
+    const btn = e.currentTarget;
+    if (btn.__popover) { btn.__popover.close(); return; }
+    openProjectEditPopover(btn, p);
+  });
+  document.getElementById('project-delete')?.addEventListener('click', async e => {
+    const btn = e.currentTarget;
+    if (btn.__popover) { btn.__popover.close(); return; }
+    const ok = await confirm(btn, 'Delete Project', `Delete "${p.name}"? The schematics themselves will not be deleted.`);
+    if (!ok) return;
+    try {
+      await API.deleteProject(id);
+      toast('Project deleted');
+      location.hash = '#/projects';
+    } catch { toast('Failed to delete project', 'error'); }
+  });
+  document.getElementById('project-add')?.addEventListener('click', e => {
+    const btn = e.currentTarget;
+    if (btn.__popover) { btn.__popover.close(); return; }
+    openAddSchematicsPopover(btn, id, items);
+  });
+}
+
+function projectCountText(n) {
+  return `${n} schematic${n === 1 ? '' : 's'}`;
+}
+
+// Renders a project's schematics in order; owners get reorder/remove controls.
+// Mutates `items` in place so callers' references stay current.
+function renderProjectSchematics(items, owner, id) {
+  const grid = document.getElementById('project-grid');
+  if (!grid) return;
+  const count = document.getElementById('project-count');
+  if (count) count.textContent = projectCountText(items.length);
+  if (!items.length) {
+    grid.className = '';
+    grid.innerHTML = `<div class="empty-state panel"><div class="empty-icon">&#128196;</div><p class="empty-text">This project has no schematics yet.</p></div>`;
+    return;
+  }
+
+  grid.className = 'schematics-grid';
+  grid.innerHTML = items.map(cardHtml).join('');
+  mountListCards(Array.from(grid.querySelectorAll('.schematic-card')));
+
+  if (!owner) return;
+  grid.querySelectorAll('.schematic-card').forEach(card => {
+    card.insertAdjacentHTML('afterbegin', `
+      <div class="project-card-actions">
+        <button type="button" class="project-card-btn" data-move="up" title="Move up" aria-label="Move up">&#8593;</button>
+        <button type="button" class="project-card-btn" data-move="down" title="Move down" aria-label="Move down">&#8595;</button>
+        <button type="button" class="project-card-btn project-card-btn-danger" data-remove title="Remove from project" aria-label="Remove from project">&#10005;</button>
+      </div>`);
+  });
+
+  grid.querySelectorAll('[data-move]').forEach(btn => btn.addEventListener('click', async e => {
+    e.stopPropagation();
+    const card = e.currentTarget.closest('.schematic-card');
+    const idx = items.findIndex(x => x.id === card.dataset.id);
+    const swap = idx + (e.currentTarget.dataset.move === 'up' ? -1 : 1);
+    if (idx < 0 || swap < 0 || swap >= items.length) return;
+    [items[idx], items[swap]] = [items[swap], items[idx]];
+    try {
+      const updated = await API.setProjectSchematics(id, items.map(x => x.id));
+      items.length = 0;
+      items.push(...(updated.schematics || []));
+      renderProjectSchematics(items, owner, id);
+    } catch (err) {
+      [items[idx], items[swap]] = [items[swap], items[idx]];
+      toast(err.message || 'Failed to reorder', 'error');
+    }
+  }));
+
+  grid.querySelectorAll('[data-remove]').forEach(btn => btn.addEventListener('click', async e => {
+    e.stopPropagation();
+    const card = e.currentTarget.closest('.schematic-card');
+    try {
+      const updated = await API.removeProjectSchematic(id, card.dataset.id);
+      items.length = 0;
+      items.push(...(updated.schematics || []));
+      renderProjectSchematics(items, owner, id);
+      toast('Removed from project');
+    } catch (err) {
+      toast(err.message || 'Failed to remove schematic', 'error');
+    }
+  }));
+}
+
+function openProjectEditPopover(anchor, project) {
+  const { pop, close } = createPopover(anchor, `
+    <h3 class="dialog-title">Edit Project</h3>
+    <form id="project-edit-form" autocomplete="off">
+      <div class="form-group">
+        <label class="label" for="pop-project-edit-name">Name</label>
+        <input class="input" id="pop-project-edit-name" value="${esc(project.name)}" maxlength="200" required />
+      </div>
+      <div class="form-group">
+        <label class="label" for="pop-project-edit-desc">Description</label>
+        <textarea class="textarea" id="pop-project-edit-desc" maxlength="5000">${esc(project.description || '')}</textarea>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" class="button button-secondary" data-act="cancel">Cancel</button>
+        <button type="submit" class="button button-primary" data-act="save">Save Changes</button>
+      </div>
+    </form>`);
+
+  pop.querySelector('[data-act="cancel"]').addEventListener('click', close);
+  pop.querySelector('#project-edit-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const btn = pop.querySelector('[data-act="save"]');
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+    try {
+      await API.updateProject(project.id, {
+        name: pop.querySelector('#pop-project-edit-name').value.trim(),
+        description: pop.querySelector('#pop-project-edit-desc').value.trim(),
+      });
+      toast('Project updated');
+      close();
+      renderProject(project.id);
+    } catch (err) {
+      toast(err.message || 'Update failed', 'error');
+      btn.disabled = false;
+      btn.textContent = 'Save Changes';
+    }
+  });
+  pop.querySelector('#pop-project-edit-name')?.focus();
+}
+
+// Lets an owner append their own schematics to the project, in one batch.
+async function openAddSchematicsPopover(anchor, projectId, items) {
+  let mine;
+  try { mine = (await API.list({ owner: 'me', limit: 200 })).items || []; } catch {
+    toast('Failed to load your schematics', 'error');
+    return;
+  }
+  const existing = new Set(items.map(m => m.id));
+  const candidates = mine.filter(m => !existing.has(m.id));
+
+  const { pop, close } = createPopover(anchor, candidates.length ? `
+    <h3 class="dialog-title">Add Schematics</h3>
+    <input class="input" id="add-schem-search" placeholder="Search your schematics..." />
+    <div class="add-schem-list" id="add-schem-list">
+      ${candidates.map(m => `<label class="add-schem-item" data-name="${esc((m.name || '').toLowerCase())}">
+        <input type="checkbox" value="${m.id}" />
+        <span>${esc(m.name)}</span>
+      </label>`).join('')}
+    </div>
+    <div class="dialog-actions">
+      <button type="button" class="button button-secondary" data-act="cancel">Cancel</button>
+      <button type="button" class="button button-primary" data-act="add">Add Selected</button>
+    </div>` : `
+    <h3 class="dialog-title">Add Schematics</h3>
+    <p class="dialog-message">All of your schematics are already in this project.</p>
+    <div class="dialog-actions">
+      <button type="button" class="button button-secondary" data-act="cancel">Close</button>
+    </div>`);
+
+  pop.querySelector('[data-act="cancel"]')?.addEventListener('click', close);
+  const search = pop.querySelector('#add-schem-search');
+  search?.addEventListener('input', () => {
+    const term = search.value.trim().toLowerCase();
+    pop.querySelectorAll('.add-schem-item').forEach(el => {
+      el.hidden = term && !el.dataset.name.includes(term);
+    });
+  });
+  search?.focus();
+
+  pop.querySelector('[data-act="add"]')?.addEventListener('click', async () => {
+    const selected = Array.from(pop.querySelectorAll('#add-schem-list input:checked')).map(i => i.value);
+    if (!selected.length) { close(); return; }
+    const ids = items.map(m => m.id).concat(selected);
+    const btn = pop.querySelector('[data-act="add"]');
+    btn.disabled = true;
+    btn.textContent = 'Adding...';
+    try {
+      const updated = await API.setProjectSchematics(projectId, ids);
+      items.length = 0;
+      items.push(...(updated.schematics || []));
+      renderProjectSchematics(items, true, projectId);
+      toast('Schematics added');
+      close();
+    } catch (err) {
+      toast(err.message || 'Failed to add schematics', 'error');
+      btn.disabled = false;
+      btn.textContent = 'Add Selected';
+    }
+  });
 }
 
 // ───────────────────────────────────────────────────────────────

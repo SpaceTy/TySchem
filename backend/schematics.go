@@ -35,6 +35,8 @@ type SchematicMetadata struct {
 	LikeCount   int     `json:"likeCount"`
 	UserRating  int     `json:"userRating"`
 	Liked       bool    `json:"liked"`
+	// Projects this schematic belongs to, filled for detail lookups only.
+	Projects []Project `json:"projects,omitempty"`
 }
 
 // ListFilter selects which IDs/metadata to return for GET /api/schematics.
@@ -101,6 +103,25 @@ CREATE TABLE IF NOT EXISTS likes (
 	PRIMARY KEY (schematic_id, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_likes_schematic ON likes(schematic_id);
+CREATE TABLE IF NOT EXISTS projects (
+	id          TEXT PRIMARY KEY,
+	name        TEXT NOT NULL,
+	description TEXT NOT NULL DEFAULT '',
+	owner_id    TEXT,
+	created_at  TEXT NOT NULL,
+	updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_projects_owner ON projects(owner_id);
+CREATE INDEX IF NOT EXISTS idx_projects_name ON projects(name);
+CREATE TABLE IF NOT EXISTS project_schematics (
+	project_id   TEXT NOT NULL,
+	schematic_id TEXT NOT NULL,
+	position     INTEGER NOT NULL DEFAULT 0,
+	added_at     TEXT NOT NULL,
+	PRIMARY KEY (project_id, schematic_id)
+);
+CREATE INDEX IF NOT EXISTS idx_project_schematics_project ON project_schematics(project_id, position);
+CREATE INDEX IF NOT EXISTS idx_project_schematics_schematic ON project_schematics(schematic_id);
 `
 
 // Store persists schematic blobs on disk and their metadata in SQLite:
@@ -355,6 +376,11 @@ func (s *Store) GetViewer(id, viewerID string) (SchematicMetadata, error) {
 		}
 		return SchematicMetadata{}, err
 	}
+	projects, err := s.ProjectsForSchematic(id)
+	if err != nil {
+		return SchematicMetadata{}, err
+	}
+	meta.Projects = projects
 	return meta, nil
 }
 
@@ -404,6 +430,9 @@ func (s *Store) Delete(id string) error {
 	}
 	// Remove blob first; keep going even if it is already gone.
 	if err := os.Remove(s.FilePath(id)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if _, err := s.db.Exec(`DELETE FROM project_schematics WHERE schematic_id = ?`, id); err != nil {
 		return err
 	}
 	res, err := s.db.Exec(`DELETE FROM schematics WHERE id = ?`, id)

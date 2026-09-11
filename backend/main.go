@@ -63,6 +63,7 @@ func main() {
 	registerUserRoutes(mux, store)
 	registerAdminRoutes(mux, store)
 	registerSchematicRoutes(mux, store)
+	registerProjectRoutes(mux, store)
 
 	// Static frontend with SPA fallback
 	fileServer := http.FileServer(http.Dir(frontendDir))

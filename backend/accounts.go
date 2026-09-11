@@ -455,12 +455,22 @@ func (s *Store) DeleteUser(id string) error {
 		if _, err := tx.Exec(`DELETE FROM likes WHERE schematic_id = ?`, sid); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(`DELETE FROM project_schematics WHERE schematic_id = ?`, sid); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM project_schematics WHERE project_id IN (SELECT id FROM projects WHERE owner_id = ?)`,
+		u.ID,
+	); err != nil {
+		return err
 	}
 	for _, q := range []string{
 		`DELETE FROM ratings WHERE user_id = ?`,
 		`DELETE FROM likes WHERE user_id = ?`,
 		`DELETE FROM sessions WHERE user_id = ?`,
 		`DELETE FROM schematics WHERE owner_id = ?`,
+		`DELETE FROM projects WHERE owner_id = ?`,
 		`DELETE FROM users WHERE id = ?`,
 	} {
 		if _, err := tx.Exec(q, u.ID); err != nil {
