@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>tyschem</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="site-header" id="site-header">
+      <a href="#/" class="site-logo">tyschem</a>
+      <nav class="site-nav">
+        <a href="#/" class="nav-link" data-nav="schematics">Schematics</a>
+        <a href="#/upload" class="nav-link" data-nav="upload">Upload</a>
+      </nav>
+    </header>
+    <main id="view" class="view-container"></main>
+    <footer class="site-footer">&copy; 2026 tyschem</footer>
+  </div>
+
+  <!-- Toast container -->
+  <div id="toast-container"></div>
+
+  <!-- Confirm dialog -->
+  <div id="confirm-overlay" class="dialog-overlay" hidden>
+    <div class="dialog-box">
+      <h3 class="dialog-title" id="confirm-title">Confirm</h3>
+      <p class="dialog-message" id="confirm-message"></p>
+      <div class="dialog-actions">
+        <button class="button button-secondary" id="confirm-cancel">Cancel</button>
+        <button class="button button-danger" id="confirm-ok">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
