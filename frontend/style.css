@@ -185,41 +185,70 @@ a:hover { color: #93c5fd; }
 /* ── Schematic cards ───────────────────────────────────────── */
 .schematics-grid {
   display: grid;
-  grid-template-columns: 1fr;
-  gap: .75rem;
+  grid-template-columns: repeat(auto-fill, minmax(14rem, 1fr));
+  gap: 1rem;
 }
 .schematic-card {
   display: flex;
-  align-items: center;
-  gap: 1rem;
-  padding: 1rem 1.25rem;
-  border-radius: .75rem;
+  flex-direction: column;
+  border-radius: .85rem;
   background: rgba(255,255,255,.03);
   border: 1px solid rgba(255,255,255,.07);
   transition: all .15s;
   cursor: pointer;
   text-decoration: none;
   color: inherit;
+  overflow: hidden;
 }
 .schematic-card:hover {
   background: rgba(96,165,250,.07);
   border-color: rgba(96,165,250,.22);
+  transform: translateY(-2px);
 }
-.card-icon {
-  width: 2.5rem; height: 2.5rem;
-  border-radius: .5rem;
-  background: rgba(59,130,246,.15);
-  display: flex; align-items: center; justify-content: center;
-  font-size: 1rem;
-  flex-shrink: 0;
+.card-thumb {
+  position: relative;
+  aspect-ratio: 16 / 11;
+  background:
+    radial-gradient(circle at 50% 38%, rgba(96,165,250,.12), rgba(0,0,0,.0) 70%),
+    linear-gradient(180deg, #0a0e16, #05070c);
+  border-bottom: 1px solid rgba(255,255,255,.06);
+  overflow: hidden;
 }
-.card-body { flex: 1; min-width: 0; }
+.card-thumb-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity .45s ease;
+  image-rendering: pixelated;
+}
+.card-thumb.thumb-ready .card-thumb-img { opacity: 1; }
+.card-thumb-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: .5rem;
+  color: #475569;
+  letter-spacing: .04em;
+}
+.card-thumb.thumb-ready .card-thumb-loading { display: none; }
+.card-thumb.thumb-error .card-thumb-loading::after { content: "no preview"; }
+.card-thumb.thumb-error .card-thumb-loading { font-size: .5rem; }
+.card-info {
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+  padding: .85rem 1rem 1rem;
+  flex: 1;
+}
 .card-name {
   color: #e2e8f0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  margin-bottom: .35rem;
   font-size: .68rem;
   line-height: 1.6;
 }
@@ -233,10 +262,11 @@ a:hover { color: #93c5fd; }
 }
 .card-meta {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: .35rem;
-  flex-shrink: 0;
+  align-items: center;
+  gap: .5rem;
+  flex-wrap: wrap;
+  margin-top: auto;
+  padding-top: .35rem;
   font-size: .52rem;
   color: #64748b;
   white-space: nowrap;
@@ -247,7 +277,7 @@ a:hover { color: #93c5fd; }
   padding: .2rem .5rem;
   border-radius: .25rem;
 }
-.card-download { flex-shrink: 0; text-decoration: none; }
+.card-download { margin-left: auto; text-decoration: none; }
 .schematic-card:focus-visible {
   outline: 2px solid rgba(96,165,250,.5);
   outline-offset: 2px;
@@ -288,6 +318,44 @@ a:hover { color: #93c5fd; }
   color: #94a3b8;
   line-height: 2;
   white-space: pre-wrap;
+}
+
+/* ── 3D viewer ─────────────────────────────────────────────── */
+.viewer-panel {
+  padding: 0;
+  overflow: hidden;
+  margin-bottom: 1rem;
+}
+.viewer-container {
+  position: relative;
+  width: 100%;
+  min-height: 12rem;
+  background: #05070c;
+}
+.viewer-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  cursor: grab;
+  touch-action: none;
+}
+.viewer-canvas.grabbing { cursor: grabbing; }
+.viewer-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: .55rem;
+  color: #475569;
+}
+.viewer-hint {
+  padding: .6rem 1rem;
+  font-size: .5rem;
+  color: #64748b;
+  text-align: center;
+  border-top: 1px solid rgba(255,255,255,.06);
+  line-height: 1.6;
 }
 
 /* ── Search / filter bar ───────────────────────────────────── */
@@ -424,6 +492,5 @@ a:hover { color: #93c5fd; }
   .page-title { font-size: .85rem; }
   .toolbar { flex-direction: column; align-items: stretch; }
   .meta-grid { grid-template-columns: 1fr; }
-  .schematic-card { flex-direction: column; align-items: flex-start; }
-  .card-meta { flex-direction: row; gap: .5rem; }
+  .schematics-grid { grid-template-columns: 1fr; }
 }

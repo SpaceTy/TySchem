@@ -96,14 +96,312 @@ function fmtDateTime(s) {
 }
 
 // ───────────────────────────────────────────────────────────────
+//  3D preview (Three.js + Lodestone)
+// ───────────────────────────────────────────────────────────────
+const LODESTONE = window.Lodestone || null;
+const THREE_LIB = window.THREE || null;
+const PACK_BASE = new URL('vendor/default-pack/', document.baseURI).href;
+
+// Twilight-blue environment tuned to the dark glass theme.
+const VIEW_ENV = {
+  shadow: { enabled: true, intensity: 0.35 },
+  postProcess: { enabled: false },
+  sky: {
+    zenithColor: [0.03, 0.05, 0.10],
+    horizonColor: [0.08, 0.13, 0.235],
+    groundColor: [0.015, 0.02, 0.035],
+    sunGlowColor: [0.35, 0.5, 0.9],
+    sunGlowIntensity: 0.18,
+  },
+  disc: { coreIntensity: 0, glowIntensity: 0 },
+  fog: { density: 0 },
+};
+
+let _previewsOk = null;
+function previewsSupported() {
+  if (_previewsOk !== null) return _previewsOk;
+  if (!LODESTONE || !THREE_LIB) return (_previewsOk = false);
+  try {
+    const c = document.createElement('canvas');
+    _previewsOk = !!(c.getContext('webgl2') || c.getContext('webgl') || c.getContext('experimental-webgl'));
+  } catch { _previewsOk = false; }
+  return _previewsOk;
+}
+
+// Load (and memoize) the bundled resource pack.
+let _packPromise = null;
+function loadPack() {
+  if (!_packPromise) {
+    _packPromise = LODESTONE.loadDefaultPackResources({ baseUrl: PACK_BASE })
+      .then(p => p.resources)
+      .catch(err => { _packPromise = null; throw err; });
+  }
+  return _packPromise;
+}
+
+// Parse (and memoize) a schematic into a Lodestone Structure.
+const _structureCache = new Map();
+function loadStructure(id) {
+  if (!_structureCache.has(id)) {
+    const p = fetch(API.downloadUrl(id))
+      .then(r => { if (!r.ok) throw new Error('failed to fetch schematic'); return r.arrayBuffer(); })
+      .then(buf => LODESTONE.LitematicLoader.load(new Uint8Array(buf)))
+      .catch(err => { _structureCache.delete(id); throw err; });
+    _structureCache.set(id, p);
+  }
+  return _structureCache.get(id);
+}
+
+// Camera placement orbiting a structure's centre.
+function orbitCamera(structure, theta, phi, margin) {
+  const [sx, sy, sz] = structure.getSize();
+  const target = [sx / 2, sy / 2, sz / 2];
+  const radius = Math.max(sx, sy, sz, 1) * margin;
+  const sinPhi = Math.sin(phi);
+  return {
+    position: [
+      target[0] + radius * Math.sin(theta) * sinPhi,
+      target[1] + radius * Math.cos(phi),
+      target[2] + radius * Math.cos(theta) * sinPhi,
+    ],
+    target,
+    up: [0, 1, 0],
+    radius,
+  };
+}
+
+// ── Card thumbnails ─────────────────────────────────────────
+const _thumbCache = new Map();     // id -> dataURL
+const _thumbPending = new Set();   // ids currently queued/rendering
+const _thumbQueue = [];
+let _thumbRunning = false;
+
+function requestThumbnail(id, imgEl) {
+  if (!id || !imgEl) return;
+  if (_thumbCache.has(id)) { setThumb(imgEl, _thumbCache.get(id)); return; }
+  if (_thumbPending.has(id)) return;
+  _thumbPending.add(id);
+  _thumbQueue.push({ id, imgEl });
+  pumpThumbQueue();
+}
+
+async function pumpThumbQueue() {
+  if (_thumbRunning) return;
+  _thumbRunning = true;
+  while (_thumbQueue.length) {
+    const job = _thumbQueue.shift();
+    try {
+      const url = _thumbCache.get(job.id) || await renderThumbnail(job.id);
+      _thumbCache.set(job.id, url);
+      if (job.imgEl.isConnected) setThumb(job.imgEl, url);
+    } catch (err) {
+      console.warn('[tyschem] thumbnail failed for', job.id, err);
+      job.imgEl.closest('.card-thumb')?.classList.add('thumb-error');
+    } finally {
+      _thumbPending.delete(job.id);
+    }
+  }
+  _thumbRunning = false;
+}
+
+function setThumb(imgEl, url) {
+  imgEl.src = url;
+  imgEl.closest('.card-thumb')?.classList.add('thumb-ready');
+}
+
+async function renderThumbnail(id) {
+  const [structure, resources] = await Promise.all([loadStructure(id), loadPack()]);
+  const width = 320;
+  const height = 220;   // matches .card-thumb aspect ratio (16 / 11)
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const renderer = new LODESTONE.ThreeStructureRenderer(canvas, structure, resources, {
+    antialias: true,
+    preserveDrawingBuffer: true,
+    sunlight: VIEW_ENV,
+  });
+  try {
+    renderer.setViewport(0, 0, width, height, 1);
+    renderer.setCamera(orbitCamera(structure, Math.PI * 0.28, Math.PI * 0.36, 1.8));
+    renderer.drawStructure();
+    return canvas.toDataURL('image/png');
+  } finally {
+    renderer.dispose();
+  }
+}
+
+// Only queue thumbnails once their card scrolls near the viewport.
+let _thumbObserver = null;
+function thumbObserver() {
+  if (!_thumbObserver) {
+    _thumbObserver = new IntersectionObserver(entries => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        _thumbObserver.unobserve(e.target);
+        const img = e.target.querySelector('.card-thumb-img');
+        requestThumbnail(e.target.dataset.id, img);
+      }
+    }, { rootMargin: '250px' });
+  }
+  return _thumbObserver;
+}
+
+// ── Interactive detail viewer ───────────────────────────────
+async function mountDetailViewer(container, id) {
+  if (!previewsSupported()) {
+    container.innerHTML = '<div class="viewer-loading">3D preview not supported in this browser.</div>';
+    return;
+  }
+  let structure, resources;
+  try {
+    [structure, resources] = await Promise.all([loadStructure(id), loadPack()]);
+  } catch (err) {
+    console.warn('[tyschem] preview failed', err);
+    container.innerHTML = '<div class="viewer-loading">Could not render preview.</div>';
+    return;
+  }
+  if (!container.isConnected) return;
+
+  const canvas = document.createElement('canvas');
+  canvas.className = 'viewer-canvas';
+  const loading = container.querySelector('.viewer-loading');
+
+  const state = {
+    theta: Math.PI * 0.28,
+    phi: Math.PI * 0.36,
+    radius: Math.max(...structure.getSize(), 1) * 1.9,
+    target: null,
+    dragging: false,
+    autoRotate: true,
+    lastX: 0,
+    lastY: 0,
+    disposed: false,
+    raf: 0,
+  };
+  const [sx, sy, sz] = structure.getSize();
+  state.target = [sx / 2, sy / 2, sz / 2];
+
+  let renderer;
+  try {
+    renderer = new LODESTONE.ThreeStructureRenderer(canvas, structure, resources, {
+      antialias: true,
+      asyncBuild: true,
+      sunlight: VIEW_ENV,
+    });
+  } catch (err) {
+    console.warn('[tyschem] renderer init failed', err);
+    container.innerHTML = '<div class="viewer-loading">Could not initialise 3D renderer.</div>';
+    return;
+  }
+
+  container.insertBefore(canvas, loading);
+
+  function resize() {
+    if (state.disposed) return;
+    const w = Math.max(container.clientWidth, 1);
+    const h = Math.max(Math.round(w * 0.62), 180);
+    renderer.setViewport(0, 0, w, h, Math.min(window.devicePixelRatio || 1, 2));
+  }
+  resize();
+
+  function updateCamera() {
+    const sinPhi = Math.sin(state.phi);
+    renderer.setCamera({
+      position: [
+        state.target[0] + state.radius * Math.sin(state.theta) * sinPhi,
+        state.target[1] + state.radius * Math.cos(state.phi),
+        state.target[2] + state.radius * Math.cos(state.theta) * sinPhi,
+      ],
+      target: state.target,
+      up: [0, 1, 0],
+    });
+  }
+
+  let firstDraw = true;
+  function renderFrame() {
+    updateCamera();
+    renderer.drawStructure();
+    if (firstDraw) { firstDraw = false; loading?.remove(); }
+  }
+  function loop() {
+    if (state.disposed) return;
+    if (state.autoRotate && !state.dragging) state.theta += 0.0035;
+    renderFrame();
+    state.raf = requestAnimationFrame(loop);
+  }
+  renderFrame();               // paint immediately, then animate
+  state.raf = requestAnimationFrame(loop);
+
+  const onDown = e => {
+    state.dragging = true;
+    state.autoRotate = false;
+    state.lastX = e.clientX;
+    state.lastY = e.clientY;
+    try { canvas.setPointerCapture(e.pointerId); } catch {}
+    canvas.classList.add('grabbing');
+  };
+  const onMove = e => {
+    if (!state.dragging) return;
+    const dx = e.clientX - state.lastX;
+    const dy = e.clientY - state.lastY;
+    state.lastX = e.clientX;
+    state.lastY = e.clientY;
+    state.theta -= dx * 0.008;
+    state.phi = Math.min(Math.PI - 0.12, Math.max(0.12, state.phi - dy * 0.008));
+  };
+  const onUp = e => {
+    state.dragging = false;
+    canvas.classList.remove('grabbing');
+    try { canvas.releasePointerCapture(e.pointerId); } catch {}
+  };
+  const onWheel = e => {
+    e.preventDefault();
+    state.autoRotate = false;
+    state.radius = Math.min(state.radius * 4, Math.max(state.radius * 0.25, state.radius * Math.exp(e.deltaY * 0.0012)));
+  };
+
+  canvas.addEventListener('pointerdown', onDown);
+  canvas.addEventListener('pointermove', onMove);
+  canvas.addEventListener('pointerup', onUp);
+  canvas.addEventListener('pointercancel', onUp);
+  canvas.addEventListener('wheel', onWheel, { passive: false });
+
+  let resizeObserver = null;
+  if (window.ResizeObserver) {
+    resizeObserver = new ResizeObserver(resize);
+    resizeObserver.observe(container);
+  }
+
+  return function cleanup() {
+    state.disposed = true;
+    cancelAnimationFrame(state.raf);
+    resizeObserver?.disconnect();
+    canvas.removeEventListener('pointerdown', onDown);
+    canvas.removeEventListener('pointermove', onMove);
+    canvas.removeEventListener('pointerup', onUp);
+    canvas.removeEventListener('pointercancel', onUp);
+    canvas.removeEventListener('wheel', onWheel);
+    try { renderer.dispose(); } catch {}
+  };
+}
+
+// ───────────────────────────────────────────────────────────────
 //  Router
 // ───────────────────────────────────────────────────────────────
 const $view = document.getElementById('view');
 let _currentAbort = null;          // AbortController to cancel in-flight fetches
+let _viewCleanup = null;           // teardown for the active view (e.g. 3D renderer)
+
+function setViewCleanup(fn) {
+  if (_viewCleanup && _viewCleanup !== fn) { try { _viewCleanup(); } catch {} }
+  _viewCleanup = fn;
+}
 
 function route() {
   if (_currentAbort) _currentAbort.abort();
   _currentAbort = new AbortController();
+  if (_viewCleanup) { try { _viewCleanup(); } catch {} _viewCleanup = null; }
 
   const hash = location.hash.slice(1) || '/';
   const parts = hash.split('/').filter(Boolean);
@@ -184,17 +482,20 @@ function renderListBody(data) {
   let grid = '<div class="schematics-grid">';
   for (const m of data.items) {
     grid += `
-      <div class="schematic-card" data-href="#/schematic/${m.id}" tabindex="0">
-        <div class="card-icon">&#128196;</div>
-        <div class="card-body">
+      <div class="schematic-card" data-id="${m.id}" data-href="#/schematic/${m.id}" tabindex="0">
+        <div class="card-thumb">
+          <img class="card-thumb-img" alt="Preview of ${esc(m.name)}" />
+          <div class="card-thumb-loading">rendering&hellip;</div>
+        </div>
+        <div class="card-info">
           <div class="card-name">${esc(m.name)}</div>
           <div class="card-desc">${esc(m.description || m.fileName)}</div>
+          <div class="card-meta">
+            <span class="card-size">${fmtBytes(m.size)}</span>
+            <span>${fmtDate(m.uploadDate)}</span>
+            <a href="${API.downloadUrl(m.id)}" class="button button-secondary button-sm card-download" download title="Download ${esc(m.fileName)}" onclick="event.stopPropagation()">Download</a>
+          </div>
         </div>
-        <div class="card-meta">
-          <span class="card-size">${fmtBytes(m.size)}</span>
-          <span>${fmtDate(m.uploadDate)}</span>
-        </div>
-        <a href="${API.downloadUrl(m.id)}" class="button button-secondary button-sm card-download" download title="Download ${esc(m.fileName)}" onclick="event.stopPropagation()">Download</a>
       </div>`;
   }
   grid += '</div>';
@@ -218,6 +519,14 @@ function renderListBody(data) {
     card.addEventListener('click', go);
     card.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
   });
+
+  // Kick off lazy 3D thumbnails.
+  if (previewsSupported()) {
+    const obs = thumbObserver();
+    el.querySelectorAll('.schematic-card').forEach(card => obs.observe(card));
+  } else {
+    el.querySelectorAll('.card-thumb').forEach(t => t.classList.add('thumb-error'));
+  }
 
   document.getElementById('pg-prev')?.addEventListener('click', () => {
     renderList({ offset: Math.max(0, _listState.offset - _listState.limit) });
@@ -344,6 +653,12 @@ async function renderDetail(id) {
           <button class="button button-danger" id="detail-delete">Delete</button>
         </div>
       </div>
+      <div class="panel viewer-panel">
+        <div class="viewer-container" id="detail-viewer">
+          <div class="viewer-loading">Loading 3D preview&hellip;</div>
+        </div>
+        <div class="viewer-hint">Drag to rotate &middot; scroll to zoom</div>
+      </div>
       <div class="panel">
         <div class="meta-grid">
           <div class="meta-item"><span class="meta-label">ID</span><span class="meta-value">${esc(meta.id)}</span></div>
@@ -365,6 +680,10 @@ async function renderDetail(id) {
       location.hash = '#/';
     } catch { toast('Failed to delete', 'error'); }
   });
+
+  // Mount the interactive 3D viewer (cleaned up on route change).
+  const viewerEl = document.getElementById('detail-viewer');
+  mountDetailViewer(viewerEl, id).then(cleanup => { if (cleanup) setViewCleanup(cleanup); });
 }
 
 // ───────────────────────────────────────────────────────────────
