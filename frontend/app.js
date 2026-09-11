@@ -421,6 +421,7 @@ async function pumpThumbQueue() {
     } finally {
       _thumbPending.delete(job.id);
     }
+    await new Promise(r => setTimeout(r, 0));
   }
   _thumbRunning = false;
 }
@@ -440,9 +441,11 @@ async function renderThumbnail(id) {
   const renderer = new LODESTONE.ThreeStructureRenderer(canvas, structure, resources, {
     antialias: true,
     preserveDrawingBuffer: true,
+    asyncBuild: true,
     sunlight: VIEW_ENV,
   });
   try {
+    await renderer.whenReady();
     renderer.setViewport(0, 0, width, height, 1);
     renderer.setCamera(orbitCamera(structure, Math.PI * 0.28, Math.PI * 0.36, 1.8));
     renderer.drawStructure();
@@ -653,7 +656,7 @@ window.addEventListener('hashchange', route);
 // ───────────────────────────────────────────────────────────────
 //  List / browse view
 // ───────────────────────────────────────────────────────────────
-let _listState = { q: '', sort: 'uploadDate', order: 'desc', limit: 24, owner: '' };
+let _listState = { q: '', author: '', sort: 'uploadDate', order: 'desc', limit: 24, owner: '' };
 let _listItems = [];        // accumulated pages
 let _listTotal = 0;         // server-side total for the active filters
 let _listRendered = 0;      // cards currently in the DOM
@@ -666,7 +669,20 @@ let _listScrollY = 0;       // saved window scroll for restoring on return
 // Identifies a result set by its filters; also the cache key used to decide
 // whether returning to the browse view should restore or start fresh.
 function listSignature(s) {
-  return [s.owner || '', s.q || '', s.sort, s.order].join('|');
+  return [s.owner || '', s.q || '', s.author || '', s.sort, s.order].join('|');
+}
+
+const sortLabels = { uploadDate: 'Upload date', updatedDate: 'Updated date', name: 'Name', size: 'Size', rating: 'Rating', likes: 'Likes' };
+
+// Labels for the two order buttons, tailored to the active sort field.
+function orderLabels(sort) {
+  switch (sort) {
+    case 'name': return { desc: 'Z to A', asc: 'A to Z' };
+    case 'size': return { desc: 'Largest first', asc: 'Smallest first' };
+    case 'rating': return { desc: 'Highest rated', asc: 'Lowest rated' };
+    case 'likes': return { desc: 'Most liked', asc: 'Least liked' };
+    default: return { desc: 'Newest first', asc: 'Oldest first' };
+  }
 }
 
 async function renderList(overrides = {}) {
@@ -687,19 +703,21 @@ async function renderList(overrides = {}) {
     return;
   }
 
-  const sortLabel = { uploadDate: 'Upload date', updatedDate: 'Updated date', name: 'Name', size: 'Size' }[s.sort] || s.sort;
+  const sortLabel = sortLabels[s.sort] || s.sort;
+  const descOrderLabel = orderLabels(s.sort).desc;
+  const ascOrderLabel = orderLabels(s.sort).asc;
   let html = `
     <div class="browse-view">
       <h2 class="page-title">${mine ? 'My Uploads' : 'Schematics'}</h2>
       <div class="browse-layout">
         <aside class="browse-rail">
-          <button type="button" class="rail-btn ${s.q ? 'active' : ''}" id="search-btn" title="Search" aria-label="Search">
+          <button type="button" class="rail-btn ${s.q || s.author ? 'active' : ''}" id="search-btn" title="Search" aria-label="Search">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
           </button>
           <button type="button" class="rail-btn" id="sort-btn" title="Sort: ${sortLabel}" aria-label="Change sort">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M6 12h12M10 18h4"/></svg>
           </button>
-          <button type="button" class="rail-btn ${s.order === 'asc' ? 'asc' : 'desc'}" id="order-btn" title="${s.order === 'desc' ? 'Newest first' : 'Oldest first'}" aria-label="Toggle sort order">
+          <button type="button" class="rail-btn ${s.order === 'asc' ? 'asc' : 'desc'}" id="order-btn" title="${s.order === 'desc' ? descOrderLabel : ascOrderLabel}" aria-label="Toggle sort order">
             <svg class="rail-order-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
           </button>
           <span class="browse-rail-count" id="rail-count" title="Loaded / total"></span>
@@ -781,7 +799,7 @@ async function loadList() {
   if (_listItems.length) setListStatus('loading', 'Loading more...');
   try {
     const data = await API.list({
-      q: s.q, sort: s.sort, order: s.order,
+      q: s.q, author: s.author, sort: s.sort, order: s.order,
       limit: s.limit, offset: _listItems.length, owner: s.owner,
     });
     if (seq !== _listSeq) return;   // a newer request superseded this one
@@ -827,29 +845,41 @@ function observeListSentinel() {
 
 // ── Browse rail popovers (styled like the detail-page popovers) ─
 function openSearchPopover(anchor) {
+  const mine = _listState.owner === 'me';
   const { pop } = createPopover(anchor, `
     <h3 class="dialog-title">Search</h3>
-    <input class="input" id="pop-search-input" placeholder="Search schematics..." value="${esc(_listState.q)}" />`, null, 'action-popover-menu');
+    <input class="input" id="pop-search-input" placeholder="Search schematics..." value="${esc(_listState.q)}" />
+    ${mine ? '' : `<input class="input" id="pop-author-input" placeholder="Filter by author..." value="${esc(_listState.author)}" />`}`, null, 'action-popover-menu');
+  const searchBtn = document.getElementById('search-btn');
+  const syncActive = () => searchBtn?.classList.toggle('active', !!(_listState.q || _listState.author));
+  const debounce = fn => {
+    let timer;
+    return () => { clearTimeout(timer); timer = setTimeout(fn, 280); };
+  };
   const input = pop.querySelector('#pop-search-input');
-  let timer;
-  input.addEventListener('input', () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => {
-      _listState.q = input.value;
-      document.getElementById('search-btn')?.classList.toggle('active', !!_listState.q);
+  input.addEventListener('input', debounce(() => {
+    _listState.q = input.value;
+    syncActive();
+    reloadList();
+  }));
+  const author = pop.querySelector('#pop-author-input');
+  if (author) {
+    author.addEventListener('input', debounce(() => {
+      _listState.author = author.value;
+      syncActive();
       reloadList();
-    }, 280);
-  });
+    }));
+  }
   input.focus();
   input.setSelectionRange(input.value.length, input.value.length);
 }
 
 function openSortPopover(anchor) {
-  const options = [['uploadDate', 'Upload date'], ['updatedDate', 'Updated date'], ['name', 'Name'], ['size', 'Size']];
+  const options = ['uploadDate', 'updatedDate', 'name', 'size', 'rating', 'likes'];
   const { pop, close } = createPopover(anchor, `
     <h3 class="dialog-title">Sort by</h3>
     <div class="popover-menu">
-      ${options.map(([v, l]) => `<button type="button" class="popover-item ${_listState.sort === v ? 'active' : ''}" data-value="${v}">${l}</button>`).join('')}
+      ${options.map(v => `<button type="button" class="popover-item ${_listState.sort === v ? 'active' : ''}" data-value="${v}">${sortLabels[v]}</button>`).join('')}
     </div>`, null, 'action-popover-menu');
   pop.querySelectorAll('.popover-item').forEach(item => item.addEventListener('click', () => {
     close();
@@ -858,11 +888,12 @@ function openSortPopover(anchor) {
 }
 
 function openOrderPopover(anchor) {
+  const { desc, asc } = orderLabels(_listState.sort);
   const { pop, close } = createPopover(anchor, `
     <h3 class="dialog-title">Order</h3>
     <div class="popover-menu">
-      <button type="button" class="popover-item ${_listState.order === 'desc' ? 'active' : ''}" data-value="desc">Newest first</button>
-      <button type="button" class="popover-item ${_listState.order === 'asc' ? 'active' : ''}" data-value="asc">Oldest first</button>
+      <button type="button" class="popover-item ${_listState.order === 'desc' ? 'active' : ''}" data-value="desc">${desc}</button>
+      <button type="button" class="popover-item ${_listState.order === 'asc' ? 'active' : ''}" data-value="asc">${asc}</button>
     </div>`, null, 'action-popover-menu');
   pop.querySelectorAll('.popover-item').forEach(item => item.addEventListener('click', () => {
     close();
@@ -1021,11 +1052,12 @@ function renderListBody() {
 
   if (!_listItems.length) {
     const mine = _listState.owner === 'me';
+    const filtered = !!(_listState.q || _listState.author);
     el.innerHTML = `
       <div class="empty-state panel">
         <div class="empty-icon">&#128196;</div>
-        <p class="empty-text">${_listState.q ? 'No schematics match your search.' : (mine ? "You haven't uploaded any schematics yet." : 'No schematics uploaded yet.')}</p>
-        ${!_listState.q ? '<p class="empty-hint"><a href="#/upload">Upload your first schematic</a></p>' : ''}
+        <p class="empty-text">${filtered ? 'No schematics match your filters.' : (mine ? "You haven't uploaded any schematics yet." : 'No schematics uploaded yet.')}</p>
+        ${!filtered ? '<p class="empty-hint"><a href="#/upload">Upload your first schematic</a></p>' : ''}
       </div>`;
     setListStatus('idle');
     updateRailCount();
@@ -1071,71 +1103,86 @@ function renderUpload() {
     return;
   }
 
+  $view.classList.add('view-wide');
   $view.innerHTML = `
-    <div class="fade-in">
+    <div class="browse-view upload-view">
       <h2 class="page-title">Upload Schematic</h2>
-      <div class="panel">
-        <form id="upload-form" autocomplete="off">
-          <div class="form-group">
-            <div class="upload-drop" id="drop-zone">
-              <div class="upload-drop-icon">&#128228;</div>
-              <div class="upload-drop-text" id="drop-text">Drag &amp; drop a <strong>.litematic</strong> file here</div>
-              <div class="upload-drop-hint">or click to browse &middot; max 50 MiB</div>
-              <input type="file" id="file-input" accept=".litematic,.litematica" hidden />
+      <div class="browse-layout upload-layout">
+        <aside class="browse-rail">
+          <button type="button" class="rail-btn rail-btn-primary" id="upload-btn" title="Choose a .litematic file" aria-label="Choose a .litematic file">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M5 20h14"/></svg>
+          </button>
+          <a href="#/" class="rail-btn" title="Cancel" aria-label="Cancel">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6L6 18"/><path d="M6 6l12 12"/></svg>
+          </a>
+        </aside>
+        <div class="browse-main fade-in">
+          <form id="upload-form" class="panel upload-form" autocomplete="off">
+            <input type="file" id="file-input" accept=".litematic,.litematica" hidden />
+            <div class="upload-fields">
+              <div class="upload-field">
+                <div class="form-group">
+                  <label class="label" for="upload-name">Name</label>
+                  <input class="input" id="upload-name" placeholder="e.g. Starter House" maxlength="200" />
+                  <div class="form-hint">Defaults to the filename if left empty.</div>
+                </div>
+              </div>
+              <div class="upload-field">
+                <div class="form-group">
+                  <label class="label" for="upload-desc">Description</label>
+                  <textarea class="textarea" id="upload-desc" placeholder="Optional description of the schematic..." maxlength="5000"></textarea>
+                </div>
+              </div>
             </div>
-          </div>
-          <div class="form-group">
-            <label class="label" for="upload-name">Name</label>
-            <input class="input" id="upload-name" placeholder="e.g. Starter House" maxlength="200" />
-            <div class="form-hint">Defaults to the filename if left empty.</div>
-          </div>
-          <div class="form-group">
-            <label class="label" for="upload-desc">Description</label>
-            <textarea class="textarea" id="upload-desc" placeholder="Optional description of the schematic..." maxlength="5000"></textarea>
-          </div>
-          <div id="upload-progress-wrap" style="display:none">
-            <div class="upload-progress"><div class="upload-progress-bar" id="upload-bar" style="width:0%"></div></div>
-          </div>
-          <div id="upload-error" style="display:none;margin-bottom:1rem;padding:.75rem 1rem;border-radius:.6rem;font-size:.82rem;background:rgba(127,29,29,.92);border:1px solid rgba(248,113,113,.3);color:#fecaca"></div>
-          <div style="display:flex;gap:.6rem;margin-top:1rem">
-            <button type="submit" class="button button-primary" id="upload-btn" disabled>Upload</button>
-            <a href="#/" class="button button-secondary">Cancel</a>
-          </div>
-        </form>
+            <div class="upload-file" id="upload-file">
+              <span class="upload-file-icon">&#128206;</span>
+              <span class="upload-file-text" id="file-text">No file selected &middot; drag &amp; drop here or use the upload button &middot; max 50 MiB</span>
+            </div>
+            <div id="upload-progress-wrap" style="display:none">
+              <div class="upload-progress"><div class="upload-progress-bar" id="upload-bar" style="width:0%"></div></div>
+            </div>
+            <div id="upload-error" style="display:none;margin-top:1rem;padding:.75rem 1rem;border-radius:.6rem;font-size:.82rem;background:rgba(127,29,29,.92);border:1px solid rgba(248,113,113,.3);color:#fecaca"></div>
+          </form>
+        </div>
       </div>
     </div>`;
 
-  const drop   = document.getElementById('drop-zone');
+  const form   = document.getElementById('upload-form');
   const input  = document.getElementById('file-input');
   const btn    = document.getElementById('upload-btn');
-  const text   = document.getElementById('drop-text');
+  const fileBar = document.getElementById('upload-file');
+  const text   = document.getElementById('file-text');
   let chosenFile = null;
 
   function setFile(f) {
     chosenFile = f;
-    btn.disabled = !f;
     if (f) {
-      drop.classList.add('has-file');
+      fileBar.classList.add('has-file');
       text.innerHTML = `<strong>${esc(f.name)}</strong> &middot; ${fmtBytes(f.size)}`;
+      btn.title = 'Upload';
+      btn.setAttribute('aria-label', 'Upload');
     } else {
-      drop.classList.remove('has-file');
-      text.innerHTML = 'Drag &amp; drop a <strong>.litematic</strong> file here';
+      fileBar.classList.remove('has-file');
+      text.innerHTML = 'No file selected &middot; drag &amp; drop here or use the upload button &middot; max 50 MiB';
+      btn.title = 'Choose a .litematic file';
+      btn.setAttribute('aria-label', 'Choose a .litematic file');
     }
   }
 
-  drop.addEventListener('click', () => input.click());
+  btn.addEventListener('click', () => { if (chosenFile) form.requestSubmit(); else input.click(); });
+  fileBar.addEventListener('click', () => input.click());
   input.addEventListener('change', () => { if (input.files[0]) setFile(input.files[0]); });
-  drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag-over'); });
-  drop.addEventListener('dragleave', () => drop.classList.remove('drag-over'));
-  drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('drag-over'); if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
+  form.addEventListener('dragover', e => { e.preventDefault(); form.classList.add('drag-over'); });
+  form.addEventListener('dragleave', () => form.classList.remove('drag-over'));
+  form.addEventListener('drop', e => { e.preventDefault(); form.classList.remove('drag-over'); if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
 
-  document.getElementById('upload-form').addEventListener('submit', async e => {
+  form.addEventListener('submit', async e => {
     e.preventDefault();
     if (!chosenFile) return;
     const errEl = document.getElementById('upload-error');
     errEl.style.display = 'none';
     btn.disabled = true;
-    btn.textContent = 'Uploading...';
+    btn.classList.add('uploading');
     document.getElementById('upload-progress-wrap').style.display = '';
     const bar = document.getElementById('upload-bar');
 
@@ -1152,7 +1199,7 @@ function renderUpload() {
       errEl.textContent = err.message || 'Upload failed';
       errEl.style.display = '';
       btn.disabled = false;
-      btn.textContent = 'Upload';
+      btn.classList.remove('uploading');
       document.getElementById('upload-progress-wrap').style.display = 'none';
     }
   });

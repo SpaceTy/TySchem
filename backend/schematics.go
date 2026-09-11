@@ -43,6 +43,7 @@ type ListFilter struct {
 	Name        string     // substring match against name
 	Description string     // substring match against description
 	OwnerID     string     // exact owner match (used for "my schematics")
+	OwnerName   string     // substring match against owner username
 	From        *time.Time // uploadDate >= From
 	To          *time.Time // uploadDate <= To
 	Sort        string     // "uploadDate" (default) | "updatedDate" | "name" | "size" | "rating" | "likes"
@@ -443,6 +444,11 @@ func whereClause(f ListFilter) (string, []any) {
 	if f.OwnerID != "" {
 		conds = append(conds, `s.owner_id = ?`)
 		args = append(args, f.OwnerID)
+	}
+	if o := strings.TrimSpace(f.OwnerName); o != "" {
+		like := "%" + escapeLike(strings.ToLower(o)) + "%"
+		conds = append(conds, `LOWER(u.username) LIKE ? ESCAPE '\'`)
+		args = append(args, like)
 	}
 	if f.From != nil {
 		conds = append(conds, `s.upload_date >= ?`)

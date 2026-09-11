@@ -165,7 +165,7 @@ func handleSchematicUpload(w http.ResponseWriter, r *http.Request, store *Store,
 	writeJSON(w, http.StatusCreated, meta)
 }
 
-// GET /api/schematics?q=&name=&description=&owner=me&from=&to=&sort=&order=&limit=&offset=&page=&pageSize=
+// GET /api/schematics?q=&name=&description=&owner=me&author=&from=&to=&sort=&order=&limit=&offset=&page=&pageSize=
 // Returns {"items":[...],"total":N,"limit":L,"offset":O,"page":P,"pageSize":L,"totalPages":T}.
 // Filters apply to both the page and the total count, so the client can
 // infinite-scroll a filtered, paginated list without pulling everything.
@@ -177,6 +177,7 @@ func handleSchematicList(w http.ResponseWriter, r *http.Request, store *Store) {
 		Description: q.Get("description"),
 		Sort:        q.Get("sort"),
 		Order:       q.Get("order"),
+		OwnerName:   q.Get("author"),
 	}
 	// pageSize is an alias for limit (matches the design-reference API).
 	limitStr := q.Get("limit")
