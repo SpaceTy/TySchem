@@ -66,11 +66,11 @@ a:hover { color: #93c5fd; }
 .nav-sub {
   position: absolute;
   top: calc(100% + .3rem);
-  left: 0;
+  left: 1.19rem;
+  right: 0;
   display: flex;
   align-items: center;
   gap: .35rem;
-  max-width: 13rem;
   padding: .22rem .6rem;
   border-radius: .45rem;
   background: rgba(59,130,246,.15);
@@ -82,7 +82,7 @@ a:hover { color: #93c5fd; }
   overflow: hidden;
 }
 .nav-sub svg { width: .8rem; height: .8rem; flex: 0 0 auto; }
-.nav-sub #nav-sub-text { overflow: hidden; text-overflow: ellipsis; }
+.nav-sub #nav-sub-text { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 
 .site-user {
   margin-left: auto;
