@@ -1,0 +1,15 @@
+# Copy this file to config.toml (same directory) and edit the values.
+# config.toml is gitignored and is loaded by the server at startup.
+# The path can be overridden with the CONFIG_FILE environment variable; PORT
+# overrides the port below.
+
+# TCP port the HTTP server listens on. Defaults to 8080.
+port = 8092
+
+[admin]
+# Built-in administrator account. It is created at startup if it does not
+# exist, promoted to admin, and its password is reset whenever it differs
+# from the value here (this file is authoritative). Leave both unset to
+# disable automatic admin provisioning.
+username = "admin"
+password = "change-me-please"

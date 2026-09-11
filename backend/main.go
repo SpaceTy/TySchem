@@ -7,15 +7,24 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 )
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	configPath := os.Getenv("CONFIG_FILE")
+	if configPath == "" {
+		configPath = "../config.toml"
+	}
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+	port := strconv.Itoa(cfg.Port)
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		port = envPort
 	}
 
 	frontendDir := os.Getenv("FRONTEND_DIR")
@@ -43,8 +52,16 @@ func main() {
 	if err := store.DeleteExpiredSessions(); err != nil {
 		log.Printf("prune sessions: %v", err)
 	}
+	if cfg.Admin.Username != "" || cfg.Admin.Password != "" {
+		admin, err := store.EnsureAdmin(cfg.Admin.Username, cfg.Admin.Password)
+		if err != nil {
+			log.Fatalf("ensure admin account: %v", err)
+		}
+		log.Printf("admin account %q ready", admin.Username)
+	}
 	registerAuthRoutes(mux, store)
 	registerUserRoutes(mux, store)
+	registerAdminRoutes(mux, store)
 	registerSchematicRoutes(mux, store)
 
 	// Static frontend with SPA fallback

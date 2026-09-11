@@ -101,6 +101,31 @@ const API = {
     if (!r.ok) throw new Error('not found');
     return r.json();
   },
+  // Admin-only account management.
+  async adminUsers() {
+    const r = await fetch('/api/admin/users');
+    if (r.status === 401) onUnauthorized();
+    if (!r.ok) throw new Error('failed to load users');
+    return r.json();
+  },
+  async adminUpdateUser(id, body) {
+    const r = await fetch('/api/admin/users/' + id, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || 'update failed');
+    return data.user;
+  },
+  async adminDeleteUser(id) {
+    const r = await fetch('/api/admin/users/' + id, { method: 'DELETE' });
+    if (!r.ok) {
+      let msg = 'delete failed';
+      try { msg = (await r.json()).error || msg; } catch {}
+      throw new Error(msg);
+    }
+  },
 };
 
 // Shared fetch for rating/like actions: maps auth failures to sign-in prompts.
@@ -135,9 +160,10 @@ async function refreshAuth() {
 }
 
 // Whether the signed-in user may edit/delete a schematic.
-// Legacy uploads have no owner and are manageable by any signed-in user.
+// Admins may manage anything; legacy uploads have no owner and are manageable
+// by any signed-in user.
 function canManage(meta) {
-  return !!currentUser && (!meta.ownerId || meta.ownerId === currentUser.id);
+  return !!currentUser && (currentUser.isAdmin || !meta.ownerId || meta.ownerId === currentUser.id);
 }
 
 function renderAuthNav() {
@@ -160,6 +186,7 @@ function renderAuthNav() {
             <p class="profile-dropdown-user">${esc(currentUser.username)}</p>
           </div>
           <div class="profile-dropdown-body">
+            ${currentUser.isAdmin ? '<a class="profile-link" href="#/admin"><span>&#9881;</span> Admin</a>' : ''}
             <a class="profile-link" href="#/user/${encodeURIComponent(currentUser.username)}"><span>&#128100;</span> My Profile</a>
             <button class="profile-logout" id="logout-btn" type="button"><span>&#10132;</span> Logout</button>
           </div>
@@ -649,6 +676,7 @@ function route() {
   if (parts[0] === 'upload') { renderUpload(); return; }
   if (parts[0] === 'schematic' && parts[1]) { renderDetail(parts[1]); return; }
   if (parts[0] === 'user' && parts[1]) { renderProfile(decodeURIComponent(parts.slice(1).join('/'))); return; }
+  if (parts[0] === 'admin') { renderAdmin(); return; }
   $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Not found</h2></div>';
 }
 window.addEventListener('hashchange', route);
@@ -1393,6 +1421,77 @@ function profileGridHtml(items, emptyText) {
     return `<div class="empty-state panel"><p class="empty-text">${esc(emptyText)}</p></div>`;
   }
   return `<div class="schematics-grid">${items.map(cardHtml).join('')}</div>`;
+}
+
+// ───────────────────────────────────────────────────────────────
+//  Admin (user management)
+// ───────────────────────────────────────────────────────────────
+async function renderAdmin() {
+  if (!currentUser || !currentUser.isAdmin) {
+    $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Not found</h2></div>';
+    return;
+  }
+  $view.innerHTML = '<div class="panel fade-in"><div class="empty-state"><p class="empty-text">Loading...</p></div></div>';
+
+  let users;
+  try {
+    users = (await API.adminUsers()).items || [];
+  } catch {
+    $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Failed to load users</h2></div>';
+    return;
+  }
+
+  $view.innerHTML = `
+    <div class="fade-in admin-view">
+      <h2 class="page-title">Admin</h2>
+      <div class="panel admin-users">
+        ${users.map(adminUserRowHtml).join('') || '<div class="empty-state"><p class="empty-text">No users.</p></div>'}
+      </div>
+    </div>`;
+
+  $view.querySelectorAll('[data-admin-action]').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      const el = e.currentTarget;
+      const user = users.find(u => u.id === el.dataset.userId);
+      if (!user) return;
+      try {
+        if (el.dataset.adminAction === 'delete') {
+          const ok = await confirm(el, 'Delete User', `Delete "${user.username}" and all of their uploads? This cannot be undone.`);
+          if (!ok) return;
+          await API.adminDeleteUser(user.id);
+          toast('User deleted');
+        } else if (el.dataset.adminAction === 'promote') {
+          await API.adminUpdateUser(user.id, { isAdmin: !user.isAdmin });
+          toast(user.isAdmin ? 'Admin access revoked' : 'Admin access granted');
+        } else if (el.dataset.adminAction === 'password') {
+          const pw = window.prompt(`New password for ${user.username} (8-72 characters)`);
+          if (!pw) return;
+          await API.adminUpdateUser(user.id, { password: pw });
+          toast('Password updated');
+        }
+        renderAdmin();
+      } catch (err) {
+        toast(err.message || 'Action failed', 'error');
+      }
+    });
+  });
+}
+
+function adminUserRowHtml(u) {
+  const isSelf = !!currentUser && currentUser.id === u.id;
+  return `
+    <div class="admin-user-row">
+      <div class="admin-user-info">
+        <span class="admin-user-name">${esc(u.username)}</span>
+        ${u.isAdmin ? '<span class="admin-badge">Admin</span>' : ''}
+        ${isSelf ? '<span class="admin-badge admin-badge-self">You</span>' : ''}
+      </div>
+      <div class="admin-user-actions">
+        <button type="button" class="button button-secondary button-sm" data-admin-action="promote" data-user-id="${u.id}"${isSelf ? ' disabled' : ''}>${u.isAdmin ? 'Revoke admin' : 'Make admin'}</button>
+        <button type="button" class="button button-secondary button-sm" data-admin-action="password" data-user-id="${u.id}">Reset password</button>
+        <button type="button" class="button button-danger button-sm" data-admin-action="delete" data-user-id="${u.id}"${isSelf ? ' disabled' : ''}>Delete</button>
+      </div>
+    </div>`;
 }
 
 async function renderProfile(username) {

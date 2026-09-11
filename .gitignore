@@ -2,3 +2,4 @@
 *.exe
 /data/
 /designreference/
+/config.toml

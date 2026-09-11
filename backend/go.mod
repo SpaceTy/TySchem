@@ -4,4 +4,7 @@ go 1.21
 
 require github.com/mattn/go-sqlite3 v1.14.52
 
-require golang.org/x/crypto v0.31.0
+require (
+	github.com/BurntSushi/toml v1.6.0
+	golang.org/x/crypto v0.31.0
+)

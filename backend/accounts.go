@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ type User struct {
 	Username     string    `json:"username"`
 	PasswordHash string    `json:"-"`
 	Bio          string    `json:"bio"`
+	IsAdmin      bool      `json:"isAdmin"`
 	CreatedAt    time.Time `json:"createdAt"`
 }
 
@@ -115,23 +117,35 @@ func (s *Store) LoginOrRegister(username, password string) (u User, created bool
 	return u, true, nil
 }
 
+// scanUser reads the standard account column list:
+// id, username, password_hash, bio, is_admin, created_at.
+func scanUser(row interface{ Scan(dest ...any) error }) (User, error) {
+	var u User
+	var created string
+	var isAdmin int
+	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Bio, &isAdmin, &created); err != nil {
+		return User{}, err
+	}
+	u.IsAdmin = isAdmin != 0
+	var err error
+	if u.CreatedAt, err = parseTime(created); err != nil {
+		return User{}, err
+	}
+	return u, nil
+}
+
 // GetUser returns the account with the given ID.
 func (s *Store) GetUser(id string) (User, error) {
 	if !validID(id) {
 		return User{}, ErrUnauthorized
 	}
-	var u User
-	var created string
-	err := s.db.QueryRow(
-		`SELECT id, username, password_hash, bio, created_at FROM users WHERE id = ?`, id,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Bio, &created)
+	u, err := scanUser(s.db.QueryRow(
+		`SELECT id, username, password_hash, bio, is_admin, created_at FROM users WHERE id = ?`, id,
+	))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrUnauthorized
 		}
-		return User{}, err
-	}
-	if u.CreatedAt, err = parseTime(created); err != nil {
 		return User{}, err
 	}
 	return u, nil
@@ -144,19 +158,10 @@ func (s *Store) GetUserByUsername(username string) (User, error) {
 	if username == "" {
 		return User{}, sql.ErrNoRows
 	}
-	var u User
-	var created string
-	err := s.db.QueryRow(
-		`SELECT id, username, password_hash, bio, created_at FROM users WHERE username = ?`,
+	return scanUser(s.db.QueryRow(
+		`SELECT id, username, password_hash, bio, is_admin, created_at FROM users WHERE username = ?`,
 		username,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Bio, &created)
-	if err != nil {
-		return User{}, err
-	}
-	if u.CreatedAt, err = parseTime(created); err != nil {
-		return User{}, err
-	}
-	return u, nil
+	))
 }
 
 // UpdateUser changes username and/or bio for an account. Pass nil for fields
@@ -221,12 +226,10 @@ func (s *Store) ChangePassword(id, currentPassword, newPassword string) error {
 // on any failure so callers cannot distinguish unknown users from bad passwords.
 func (s *Store) Authenticate(username, password string) (User, error) {
 	username = strings.TrimSpace(username)
-	var u User
-	var created string
-	err := s.db.QueryRow(
-		`SELECT id, username, password_hash, bio, created_at FROM users WHERE username = ?`,
+	u, err := scanUser(s.db.QueryRow(
+		`SELECT id, username, password_hash, bio, is_admin, created_at FROM users WHERE username = ?`,
 		username,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Bio, &created)
+	))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Spend roughly the same time as a real compare to avoid user-enumeration timing.
@@ -237,9 +240,6 @@ func (s *Store) Authenticate(username, password string) (User, error) {
 	}
 	if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) != nil {
 		return User{}, ErrInvalidLogin
-	}
-	if u.CreatedAt, err = parseTime(created); err != nil {
-		return User{}, err
 	}
 	return u, nil
 }
@@ -285,21 +285,16 @@ func (s *Store) UserForSession(token string) (User, error) {
 	if token == "" {
 		return User{}, ErrUnauthorized
 	}
-	var u User
-	var created string
-	err := s.db.QueryRow(`
-		SELECT u.id, u.username, u.bio, u.created_at
+	u, err := scanUser(s.db.QueryRow(`
+		SELECT u.id, u.username, u.password_hash, u.bio, u.is_admin, u.created_at
 		FROM sessions s JOIN users u ON u.id = s.user_id
 		WHERE s.token = ? AND s.expires_at > ?`,
 		hashToken(token), formatTime(time.Now().UTC()),
-	).Scan(&u.ID, &u.Username, &u.Bio, &created)
+	))
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrUnauthorized
 		}
-		return User{}, err
-	}
-	if u.CreatedAt, err = parseTime(created); err != nil {
 		return User{}, err
 	}
 	return u, nil
@@ -318,4 +313,159 @@ func (s *Store) DeleteSession(token string) error {
 func (s *Store) DeleteExpiredSessions() error {
 	_, err := s.db.Exec(`DELETE FROM sessions WHERE expires_at <= ?`, formatTime(time.Now().UTC()))
 	return err
+}
+
+// ── Admin accounts ─────────────────────────────────────────────
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// EnsureAdmin provisions the configured administrator account: it creates the
+// account when missing, promotes an existing one, and resets the password
+// whenever it differs from the configured value (the config is authoritative).
+func (s *Store) EnsureAdmin(username, password string) (User, error) {
+	username = strings.TrimSpace(username)
+	if username == "" || password == "" {
+		return User{}, errors.New("admin username and password must both be set")
+	}
+	if err := validateCredentials(username, password); err != nil {
+		return User{}, err
+	}
+	u, err := s.GetUserByUsername(username)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if u, err = s.CreateUser(username, password); err != nil {
+			return User{}, err
+		}
+	case err != nil:
+		return User{}, err
+	default:
+		if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) != nil {
+			hash, herr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+			if herr != nil {
+				return User{}, herr
+			}
+			if _, herr := s.db.Exec(`UPDATE users SET password_hash = ? WHERE id = ?`, string(hash), u.ID); herr != nil {
+				return User{}, herr
+			}
+		}
+	}
+	if !u.IsAdmin {
+		if err := s.SetAdmin(u.ID, true); err != nil {
+			return User{}, err
+		}
+		u.IsAdmin = true
+	}
+	return u, nil
+}
+
+// SetAdmin flips the administrator flag on an account.
+func (s *Store) SetAdmin(id string, admin bool) error {
+	if !validID(id) {
+		return ErrUnauthorized
+	}
+	_, err := s.db.Exec(`UPDATE users SET is_admin = ? WHERE id = ?`, boolToInt(admin), id)
+	return err
+}
+
+// SetPassword replaces an account's password without checking the old one.
+// Intended for administrator resets; callers must already be authorized.
+func (s *Store) SetPassword(id, password string) error {
+	if !validID(id) {
+		return ErrUnauthorized
+	}
+	if len(password) < passwordMinLen || len(password) > passwordMaxLen {
+		return fmt.Errorf("password must be %d-%d characters", passwordMinLen, passwordMaxLen)
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE users SET password_hash = ? WHERE id = ?`, string(hash), id)
+	return err
+}
+
+// ListUsers returns every account ordered case-insensitively by username.
+func (s *Store) ListUsers() ([]User, error) {
+	rows, err := s.db.Query(
+		`SELECT id, username, password_hash, bio, is_admin, created_at FROM users ORDER BY username COLLATE NOCASE`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	users := []User{}
+	for rows.Next() {
+		u, err := scanUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	return users, rows.Err()
+}
+
+// DeleteUser removes an account and everything referencing it: its schematics
+// (rows plus blobs), the feedback left on those schematics, its own ratings,
+// likes and sessions.
+func (s *Store) DeleteUser(id string) error {
+	if !validID(id) {
+		return ErrUnauthorized
+	}
+	u, err := s.GetUser(id)
+	if err != nil {
+		return err
+	}
+	rows, err := s.db.Query(`SELECT id FROM schematics WHERE owner_id = ?`, u.ID)
+	if err != nil {
+		return err
+	}
+	var owned []string
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err != nil {
+			rows.Close()
+			return err
+		}
+		owned = append(owned, sid)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, sid := range owned {
+		if err := os.Remove(s.FilePath(sid)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, sid := range owned {
+		if _, err := tx.Exec(`DELETE FROM ratings WHERE schematic_id = ?`, sid); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM likes WHERE schematic_id = ?`, sid); err != nil {
+			return err
+		}
+	}
+	for _, q := range []string{
+		`DELETE FROM ratings WHERE user_id = ?`,
+		`DELETE FROM likes WHERE user_id = ?`,
+		`DELETE FROM sessions WHERE user_id = ?`,
+		`DELETE FROM schematics WHERE owner_id = ?`,
+		`DELETE FROM users WHERE id = ?`,
+	} {
+		if _, err := tx.Exec(q, u.ID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }

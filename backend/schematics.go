@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS users (
 	username      TEXT NOT NULL COLLATE NOCASE UNIQUE,
 	password_hash TEXT NOT NULL,
 	bio           TEXT NOT NULL DEFAULT '',
+	is_admin      INTEGER NOT NULL DEFAULT 0,
 	created_at    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -157,6 +158,11 @@ func NewStore(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("migrate users.bio: %w", err)
 	}
+	// Migration: databases created before admin accounts existed lack users.is_admin.
+	if err := s.ensureColumn("users", "is_admin", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate users.is_admin: %w", err)
+	}
 	return s, nil
 }
 
@@ -200,9 +206,10 @@ func (s *Store) FilePath(id string) string {
 var ErrNotFound = errors.New("schematic not found")
 
 // CanManage reports whether user u may edit or delete meta.
-// Legacy uploads with no owner are manageable by any authenticated user.
+// Admins can manage anything; legacy uploads with no owner are manageable by
+// any authenticated user.
 func CanManage(meta SchematicMetadata, u User) bool {
-	return meta.OwnerID == "" || meta.OwnerID == u.ID
+	return u.IsAdmin || meta.OwnerID == "" || meta.OwnerID == u.ID
 }
 
 func validID(id string) bool {
