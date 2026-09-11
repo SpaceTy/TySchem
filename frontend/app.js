@@ -920,7 +920,7 @@ function cardHtml(m) {
         <span class="card-owner">${esc(m.ownerName || 'anonymous')}</span>
         <span class="card-date">${fmtDate(m.uploadDate)}</span>
         <a href="${API.downloadUrl(m.id)}" class="button button-secondary button-sm card-download" download title="Download ${esc(m.fileName)}" onclick="event.stopPropagation()">Download</a>
-        <button type="button" class="like-btn ${m.liked ? 'liked' : ''}" data-like title="Like" aria-label="Like" aria-pressed="${m.liked}">
+        <button type="button" class="like-btn ${m.likeCount ? 'liked' : ''}" data-like title="Like" aria-label="Like" aria-pressed="${m.liked}">
           ${heartSvg()}<span class="like-count">${m.likeCount || 0}</span>
         </button>
       </div>
@@ -962,7 +962,7 @@ function ratingSummaryText(m) {
 
 // Applies a fresh metadata object to a like button (card or detail rail).
 function applyLikeState(btn, meta) {
-  btn.classList.toggle('liked', !!meta.liked);
+  btn.classList.toggle('liked', !!meta.likeCount);
   btn.setAttribute('aria-pressed', String(!!meta.liked));
   const count = btn.querySelector('.like-count');
   if (count) count.textContent = meta.likeCount || 0;
@@ -1257,7 +1257,7 @@ async function renderDetail(id) {
           <a href="${dlUrl}" class="rail-btn" download title="Download" aria-label="Download">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
           </a>
-          <button type="button" class="rail-btn like-rail ${meta.liked ? 'liked' : ''}" id="detail-like" data-like title="Like" aria-label="Like" aria-pressed="${meta.liked}">
+          <button type="button" class="rail-btn like-rail ${meta.likeCount ? 'liked' : ''}" id="detail-like" data-like title="Like" aria-label="Like" aria-pressed="${meta.liked}">
             ${heartSvg()}<span class="like-count">${meta.likeCount || 0}</span>
           </button>
           ${owner ? `<button type="button" class="rail-btn" id="detail-edit" title="Edit" aria-label="Edit">
