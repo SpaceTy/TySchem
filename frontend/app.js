@@ -153,6 +153,17 @@ function closeProfileMenus(e) {
 document.addEventListener('click', closeProfileMenus);
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeProfileMenus(); });
 
+function closeBrowseSearch() {
+  document.querySelectorAll('.browse-rail.search-open').forEach(rail => rail.classList.remove('search-open'));
+}
+document.addEventListener('click', e => {
+  document.querySelectorAll('.browse-rail.search-open').forEach(rail => {
+    if (e.target && rail.contains(e.target)) return;
+    rail.classList.remove('search-open');
+  });
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeBrowseSearch(); });
+
 async function doLogout() {
   try { await API.logout(); } catch {}
   currentUser = null;
@@ -326,8 +337,8 @@ function setThumb(imgEl, url) {
 
 async function renderThumbnail(id) {
   const [structure, resources] = await Promise.all([loadStructure(id), loadPack()]);
-  const width = 320;
-  const height = 220;   // matches .card-thumb aspect ratio (16 / 11)
+  const width = 280;
+  const height = 280;   // square to match the compact .card-thumb
   const canvas = document.createElement('canvas');
   canvas.width = width;
   canvas.height = height;
@@ -517,6 +528,7 @@ function route() {
   if (_currentAbort) _currentAbort.abort();
   _currentAbort = new AbortController();
   if (_viewCleanup) { try { _viewCleanup(); } catch {} _viewCleanup = null; }
+  $view.classList.remove('view-wide');
 
   const hash = location.hash.slice(1) || '/';
   const parts = hash.split('/').filter(Boolean);
@@ -560,34 +572,50 @@ async function renderList(overrides = {}) {
     return;
   }
 
+  const sortLabel = { uploadDate: 'Upload date', updatedDate: 'Updated date', name: 'Name', size: 'Size' }[s.sort] || s.sort;
   let html = `
     <div class="fade-in">
       <h2 class="page-title">${mine ? 'My Uploads' : 'Schematics'}</h2>
-      <div class="toolbar">
-        <input class="input" id="search-input" placeholder="Search schematics..." value="${esc(s.q)}" />
-        <select class="select" id="sort-select">
-          <option value="uploadDate"  ${s.sort === 'uploadDate'  ? 'selected' : ''}>Upload date</option>
-          <option value="updatedDate" ${s.sort === 'updatedDate' ? 'selected' : ''}>Updated date</option>
-          <option value="name"        ${s.sort === 'name'        ? 'selected' : ''}>Name</option>
-          <option value="size"        ${s.sort === 'size'        ? 'selected' : ''}>Size</option>
-        </select>
-        <select class="select" id="order-select">
-          <option value="desc" ${s.order === 'desc' ? 'selected' : ''}>Newest first</option>
-          <option value="asc"  ${s.order === 'asc'  ? 'selected' : ''}>Oldest first</option>
-        </select>
+      <div class="browse-layout">
+        <aside class="browse-rail">
+          <button type="button" class="rail-btn" id="search-toggle" title="Search" aria-label="Search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          </button>
+          <input class="input rail-search" id="search-input" placeholder="Search..." value="${esc(s.q)}" />
+          <button type="button" class="rail-btn" id="sort-btn" title="Sort: ${sortLabel}" aria-label="Change sort">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M6 12h12M10 18h4"/></svg>
+          </button>
+          <button type="button" class="rail-btn ${s.order === 'asc' ? 'asc' : 'desc'}" id="order-btn" title="${s.order === 'desc' ? 'Newest first' : 'Oldest first'}" aria-label="Toggle sort order">
+            <svg class="rail-order-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
+          </button>
+          <div class="browse-rail-pagination" id="rail-pagination"></div>
+        </aside>
+        <div class="browse-main">
+          <div id="list-body"><div class="empty-state"><div class="empty-icon">...</div><p class="empty-text">Loading...</p></div></div>
+        </div>
       </div>
-      <div id="list-body"><div class="empty-state"><div class="empty-icon">...</div><p class="empty-text">Loading...</p></div></div>
     </div>`;
+  $view.classList.add('view-wide');
   $view.innerHTML = html;
 
   // events
   let searchTimer;
+  const railEl = document.querySelector('.browse-rail');
+  document.getElementById('search-toggle').addEventListener('click', () => {
+    const open = railEl.classList.toggle('search-open');
+    if (open) document.getElementById('search-input').focus();
+  });
   document.getElementById('search-input').addEventListener('input', e => {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => renderList({ q: e.target.value, offset: 0 }), 280);
   });
-  document.getElementById('sort-select').addEventListener('change', e => renderList({ sort: e.target.value, offset: 0 }));
-  document.getElementById('order-select').addEventListener('change', e => renderList({ order: e.target.value, offset: 0 }));
+  const sortOrder = ['uploadDate', 'updatedDate', 'name', 'size'];
+  document.getElementById('sort-btn').addEventListener('click', () => {
+    renderList({ sort: sortOrder[(sortOrder.indexOf(s.sort) + 1) % sortOrder.length], offset: 0 });
+  });
+  document.getElementById('order-btn').addEventListener('click', () => {
+    renderList({ order: s.order === 'desc' ? 'asc' : 'desc', offset: 0 });
+  });
 
   // fetch
   try {
@@ -616,35 +644,44 @@ function renderListBody(data) {
   for (const m of data.items) {
     grid += `
       <div class="schematic-card" data-id="${m.id}" data-href="#/schematic/${m.id}" tabindex="0">
-        <div class="card-thumb">
-          <img class="card-thumb-img" alt="Preview of ${esc(m.name)}" />
-          <div class="card-thumb-loading">rendering&hellip;</div>
-        </div>
-        <div class="card-info">
-          <div class="card-name">${esc(m.name)}</div>
-          <div class="card-desc">${esc(m.description || m.fileName)}</div>
-          <div class="card-meta">
-            <span class="card-size">${fmtBytes(m.size)}</span>
-            <span class="card-owner">${esc(m.ownerName || 'anonymous')}</span>
-            <span>${fmtDate(m.uploadDate)}</span>
-            <a href="${API.downloadUrl(m.id)}" class="button button-secondary button-sm card-download" download title="Download ${esc(m.fileName)}" onclick="event.stopPropagation()">Download</a>
+        <div class="card-head">
+          <div class="card-thumb">
+            <img class="card-thumb-img" alt="Preview of ${esc(m.name)}" />
+            <div class="card-thumb-loading"></div>
           </div>
+          <div class="card-title-wrap">
+            <div class="card-name">${esc(m.name)}</div>
+            <div class="card-desc">${esc(m.description || m.fileName)}</div>
+          </div>
+        </div>
+        <div class="card-meta">
+          <span class="card-size">${fmtBytes(m.size)}</span>
+          <span class="card-owner">${esc(m.ownerName || 'anonymous')}</span>
+          <span class="card-date">${fmtDate(m.uploadDate)}</span>
+          <a href="${API.downloadUrl(m.id)}" class="button button-secondary button-sm card-download" download title="Download ${esc(m.fileName)}" onclick="event.stopPropagation()">Download</a>
         </div>
       </div>`;
   }
   grid += '</div>';
 
-  // pagination
+  // pagination lives in the fixed right-hand rail
   const totalPages = Math.ceil(data.total / _listState.limit) || 1;
   const curPage = Math.floor(data.offset / _listState.limit) + 1;
   const hasPrev = data.offset > 0;
   const hasNext = data.offset + data.items.length < data.total;
-  grid += `
-    <div class="pagination">
-      <button class="button button-secondary button-sm" id="pg-prev" ${!hasPrev ? 'disabled' : ''}>&#8249; Prev</button>
-      <span class="page-info">${curPage} / ${totalPages} &middot; ${data.total} total</span>
-      <button class="button button-secondary button-sm" id="pg-next" ${!hasNext ? 'disabled' : ''}>Next &#8250;</button>
-    </div>`;
+  const pagination = document.getElementById('rail-pagination');
+  if (pagination) {
+    pagination.innerHTML = `
+      <div class="pagination">
+        <button class="rail-btn" id="pg-prev" title="Previous page" aria-label="Previous page" ${!hasPrev ? 'disabled' : ''}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 15l-6-6-6 6"/></svg>
+        </button>
+        <span class="page-info" title="${data.total} total">${curPage}/${totalPages}</span>
+        <button class="rail-btn" id="pg-next" title="Next page" aria-label="Next page" ${!hasNext ? 'disabled' : ''}>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+        </button>
+      </div>`;
+  }
 
   el.innerHTML = grid;
 
