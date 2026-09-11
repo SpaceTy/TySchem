@@ -153,9 +153,10 @@ func handleSchematicUpload(w http.ResponseWriter, r *http.Request, store *Store,
 	writeJSON(w, http.StatusCreated, meta)
 }
 
-// GET /api/schematics?q=&name=&description=&from=&to=&sort=&order=&limit=&offset=
-// Returns {"items":[...],"total":N,"limit":L,"offset":O} — the metadata index
-// the frontend uses to resolve IDs before fetching blobs.
+// GET /api/schematics?q=&name=&description=&owner=me&from=&to=&sort=&order=&limit=&offset=&page=&pageSize=
+// Returns {"items":[...],"total":N,"limit":L,"offset":O,"page":P,"pageSize":L,"totalPages":T}.
+// Filters apply to both the page and the total count, so the client can
+// infinite-scroll a filtered, paginated list without pulling everything.
 func handleSchematicList(w http.ResponseWriter, r *http.Request, store *Store) {
 	q := r.URL.Query()
 	f := ListFilter{
@@ -164,6 +165,45 @@ func handleSchematicList(w http.ResponseWriter, r *http.Request, store *Store) {
 		Description: q.Get("description"),
 		Sort:        q.Get("sort"),
 		Order:       q.Get("order"),
+	}
+	// pageSize is an alias for limit (matches the design-reference API).
+	limitStr := q.Get("limit")
+	if ps := q.Get("pageSize"); ps != "" {
+		limitStr = ps
+	}
+	if limitStr != "" {
+		n, err := strconv.Atoi(limitStr)
+		if err != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "invalid limit")
+			return
+		}
+		f.Limit = n
+	} else {
+		f.Limit = 24
+	}
+	if f.Limit > MaxListLimit {
+		f.Limit = MaxListLimit
+	}
+	// offset, then page (1-based) which overrides offset when present.
+	if s := q.Get("offset"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "invalid offset")
+			return
+		}
+		f.Offset = n
+	}
+	if s := q.Get("page"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 1 {
+			writeErr(w, http.StatusBadRequest, "invalid page (want >= 1)")
+			return
+		}
+		if f.Limit > 0 {
+			f.Offset = (n - 1) * f.Limit
+		} else {
+			f.Offset = 0
+		}
 	}
 	if owner := q.Get("owner"); owner != "" {
 		if owner != "me" {
@@ -209,28 +249,6 @@ func handleSchematicList(w http.ResponseWriter, r *http.Request, store *Store) {
 		}
 		f.To = &t
 	}
-	if s := q.Get("limit"); s != "" {
-		n, err := strconv.Atoi(s)
-		if err != nil || n < 0 {
-			writeErr(w, http.StatusBadRequest, "invalid limit")
-			return
-		}
-		f.Limit = n
-	} else {
-		f.Limit = 50
-	}
-	if f.Limit > MaxListLimit {
-		f.Limit = MaxListLimit
-	}
-	if s := q.Get("offset"); s != "" {
-		n, err := strconv.Atoi(s)
-		if err != nil || n < 0 {
-			writeErr(w, http.StatusBadRequest, "invalid offset")
-			return
-		}
-		f.Offset = n
-	}
-
 	items, total, err := store.List(f)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to list schematics")
@@ -239,11 +257,21 @@ func handleSchematicList(w http.ResponseWriter, r *http.Request, store *Store) {
 	if items == nil {
 		items = []SchematicMetadata{}
 	}
+	// Pagination metadata: page is derived from limit+offset when the caller
+	// used offset directly; totalPages lets the client stop requesting.
+	page, totalPages := 1, 0
+	if f.Limit > 0 {
+		page = f.Offset/f.Limit + 1
+		totalPages = (total + f.Limit - 1) / f.Limit
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"items":  items,
-		"total":  total,
-		"limit":  f.Limit,
-		"offset": f.Offset,
+		"items":      items,
+		"total":      total,
+		"limit":      f.Limit,
+		"offset":     f.Offset,
+		"page":       page,
+		"pageSize":   f.Limit,
+		"totalPages": totalPages,
 	})
 }
 

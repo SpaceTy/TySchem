@@ -599,7 +599,7 @@ function route() {
 
   if (parts.length === 0 || (parts.length === 1 && parts[0] === '')) { renderList({ owner: '' }); return; }
   if (parts[0] === 'login' || parts[0] === 'register') { renderAuth(); return; }
-  if (parts[0] === 'mine') { renderList({ owner: 'me', offset: 0 }); return; }
+  if (parts[0] === 'mine') { renderList({ owner: 'me' }); return; }
   if (parts[0] === 'upload') { renderUpload(); return; }
   if (parts[0] === 'schematic' && parts[1]) { renderDetail(parts[1]); return; }
   $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Not found</h2></div>';
@@ -609,7 +609,21 @@ window.addEventListener('hashchange', route);
 // ───────────────────────────────────────────────────────────────
 //  List / browse view
 // ───────────────────────────────────────────────────────────────
-let _listState = { q: '', sort: 'uploadDate', order: 'desc', limit: 20, offset: 0, owner: '' };
+let _listState = { q: '', sort: 'uploadDate', order: 'desc', limit: 24, owner: '' };
+let _listItems = [];        // accumulated pages
+let _listTotal = 0;         // server-side total for the active filters
+let _listRendered = 0;      // cards currently in the DOM
+let _listLoading = false;
+let _listSeq = 0;           // guards against stale (out-of-order) responses
+let _listObserver = null;   // infinite-scroll sentinel observer
+let _listSignature = '';    // filter signature the loaded items belong to
+let _listScrollY = 0;       // saved window scroll for restoring on return
+
+// Identifies a result set by its filters; also the cache key used to decide
+// whether returning to the browse view should restore or start fresh.
+function listSignature(s) {
+  return [s.owner || '', s.q || '', s.sort, s.order].join('|');
+}
 
 async function renderList(overrides = {}) {
   Object.assign(_listState, overrides);
@@ -644,10 +658,12 @@ async function renderList(overrides = {}) {
           <button type="button" class="rail-btn ${s.order === 'asc' ? 'asc' : 'desc'}" id="order-btn" title="${s.order === 'desc' ? 'Newest first' : 'Oldest first'}" aria-label="Toggle sort order">
             <svg class="rail-order-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
           </button>
-          <div class="browse-rail-pagination" id="rail-pagination"></div>
+          <span class="browse-rail-count" id="rail-count" title="Loaded / total"></span>
         </aside>
         <div class="browse-main fade-in">
           <div id="list-body"><div class="empty-state"><div class="empty-icon">...</div><p class="empty-text">Loading...</p></div></div>
+          <div id="list-status" class="list-status" hidden></div>
+          <div id="list-sentinel" class="list-sentinel" aria-hidden="true"></div>
         </div>
       </div>
     </div>`;
@@ -666,18 +682,103 @@ async function renderList(overrides = {}) {
   withPopover('sort-btn', openSortPopover);
   withPopover('order-btn', openOrderPopover);
 
+  const sig = listSignature(s);
+  const restore = sig === _listSignature && _listItems.length > 0;
+
+  // Register teardown before creating the observer so a re-render's cleanup
+  // doesn't disconnect the fresh observer. Snapshot the scroll position so
+  // returning from a detail page restores the same filters + position.
+  setViewCleanup(() => {
+    _listScrollY = window.scrollY;
+    _listObserver?.disconnect();
+    _listObserver = null;
+  });
+
+  if (restore) {
+    renderListBody();
+    observeListSentinel();
+    requestAnimationFrame(() => window.scrollTo(0, _listScrollY));
+    return;
+  }
+
+  _listSignature = sig;
+  resetList();
+  observeListSentinel();
   await loadList();
 }
 
+// Clears accumulated pages so the next load starts from the first page.
+function resetList() {
+  _listSeq++;
+  _listItems = [];
+  _listTotal = 0;
+  _listRendered = 0;
+  _listLoading = false;
+  const body = document.getElementById('list-body');
+  if (body) body.innerHTML = '<div class="empty-state"><div class="empty-icon">...</div><p class="empty-text">Loading...</p></div>';
+  setListStatus('loading', 'Loading...');
+  updateRailCount();
+}
+
+// Reset + refetch without rebuilding the view shell (used by the search box,
+// whose popover must stay anchored while typing).
+async function reloadList() {
+  _listSignature = listSignature(_listState);
+  resetList();
+  requestAnimationFrame(maybeLoadMore);
+  await loadList();
+}
+
+// Fetches the next page of the current (filtered) result set and appends it.
 async function loadList() {
   const s = _listState;
+  const seq = ++_listSeq;
+  _listLoading = true;
+  if (_listItems.length) setListStatus('loading', 'Loading more...');
   try {
-    const data = await API.list({ q: s.q, sort: s.sort, order: s.order, limit: s.limit, offset: s.offset, owner: s.owner });
-    renderListBody(data);
+    const data = await API.list({
+      q: s.q, sort: s.sort, order: s.order,
+      limit: s.limit, offset: _listItems.length, owner: s.owner,
+    });
+    if (seq !== _listSeq) return;   // a newer request superseded this one
+    _listTotal = data.total || 0;
+    if (data.items && data.items.length) _listItems = _listItems.concat(data.items);
+    renderListBody();
   } catch (err) {
-    if (err.name === 'AbortError') return;
-    document.getElementById('list-body').innerHTML = '<div class="empty-state"><p class="empty-text" style="color:#ef4444">Failed to load schematics.</p></div>';
+    if (err.name === 'AbortError' || seq !== _listSeq) return;
+    const el = document.getElementById('list-body');
+    if (el && !_listItems.length) {
+      el.innerHTML = '<div class="empty-state"><p class="empty-text" style="color:#ef4444">Failed to load schematics.</p></div>';
+    }
+    setListStatus('error', 'Failed to load more.');
+  } finally {
+    if (seq === _listSeq) {
+      _listLoading = false;
+      // The sentinel may still be in view (short page); keep filling.
+      requestAnimationFrame(maybeLoadMore);
+    }
   }
+}
+
+// Loads the next page only when the sentinel is at/near the viewport, so
+// short result sets fill the screen without pulling the whole library at once.
+function maybeLoadMore() {
+  if (_listLoading) return;
+  if (!_listItems.length || _listItems.length >= _listTotal) return;
+  const sentinel = document.getElementById('list-sentinel');
+  if (!sentinel) return;
+  if (sentinel.getBoundingClientRect().top > window.innerHeight + 500) return;
+  loadList();
+}
+
+function observeListSentinel() {
+  const sentinel = document.getElementById('list-sentinel');
+  if (!sentinel || !('IntersectionObserver' in window)) return;
+  _listObserver?.disconnect();
+  _listObserver = new IntersectionObserver(entries => {
+    if (entries.some(e => e.isIntersecting)) maybeLoadMore();
+  }, { rootMargin: '500px' });
+  _listObserver.observe(sentinel);
 }
 
 // ── Browse rail popovers (styled like the detail-page popovers) ─
@@ -691,9 +792,8 @@ function openSearchPopover(anchor) {
     clearTimeout(timer);
     timer = setTimeout(() => {
       _listState.q = input.value;
-      _listState.offset = 0;
       document.getElementById('search-btn')?.classList.toggle('active', !!_listState.q);
-      loadList();
+      reloadList();
     }, 280);
   });
   input.focus();
@@ -709,7 +809,7 @@ function openSortPopover(anchor) {
     </div>`, null, 'action-popover-menu');
   pop.querySelectorAll('.popover-item').forEach(item => item.addEventListener('click', () => {
     close();
-    renderList({ sort: item.dataset.value, offset: 0 });
+    renderList({ sort: item.dataset.value });
   }));
 }
 
@@ -722,13 +822,69 @@ function openOrderPopover(anchor) {
     </div>`, null, 'action-popover-menu');
   pop.querySelectorAll('.popover-item').forEach(item => item.addEventListener('click', () => {
     close();
-    renderList({ order: item.dataset.value, offset: 0 });
+    renderList({ order: item.dataset.value });
   }));
 }
 
-function renderListBody(data) {
+function cardHtml(m) {
+  return `
+    <div class="schematic-card" data-id="${m.id}" data-href="#/schematic/${m.id}" tabindex="0">
+      <div class="card-head">
+        <div class="card-thumb">
+          <img class="card-thumb-img" alt="Preview of ${esc(m.name)}" />
+          <div class="card-thumb-loading"></div>
+        </div>
+        <div class="card-title-wrap">
+          <div class="card-name">${esc(m.name)}</div>
+          <div class="card-desc">${esc(m.description || m.fileName)}</div>
+        </div>
+      </div>
+      <div class="card-meta">
+        <span class="card-size">${fmtBytes(m.size)}</span>
+        <span class="card-owner">${esc(m.ownerName || 'anonymous')}</span>
+        <span class="card-date">${fmtDate(m.uploadDate)}</span>
+        <a href="${API.downloadUrl(m.id)}" class="button button-secondary button-sm card-download" download title="Download ${esc(m.fileName)}" onclick="event.stopPropagation()">Download</a>
+      </div>
+    </div>`;
+}
+
+function mountListCards(cards) {
+  for (const card of cards) {
+    const go = () => { location.hash = card.dataset.href; };
+    card.addEventListener('click', go);
+    card.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+  }
+  if (previewsSupported()) {
+    const obs = thumbObserver();
+    cards.forEach(card => obs.observe(card));
+  } else {
+    cards.forEach(card => card.querySelector('.card-thumb')?.classList.add('thumb-error'));
+  }
+}
+
+function setListStatus(kind, text = '') {
+  const el = document.getElementById('list-status');
+  if (!el) return;
+  if (kind === 'idle' || kind === 'more' || !text) { el.hidden = true; el.innerHTML = ''; return; }
+  el.hidden = false;
+  el.classList.toggle('list-status-error', kind === 'error');
+  el.innerHTML = kind === 'loading'
+    ? `<span class="list-spinner"></span><span>${esc(text)}</span>`
+    : esc(text);
+}
+
+function updateRailCount() {
+  const el = document.getElementById('rail-count');
+  if (!el) return;
+  if (_listTotal > 0) { el.hidden = false; el.textContent = `${_listItems.length}/${_listTotal}`; }
+  else { el.hidden = true; el.textContent = ''; }
+}
+
+function renderListBody() {
   const el = document.getElementById('list-body');
-  if (!data.items || data.items.length === 0) {
+  if (!el) return;
+
+  if (!_listItems.length) {
     const mine = _listState.owner === 'me';
     el.innerHTML = `
       <div class="empty-state panel">
@@ -736,76 +892,31 @@ function renderListBody(data) {
         <p class="empty-text">${_listState.q ? 'No schematics match your search.' : (mine ? "You haven't uploaded any schematics yet." : 'No schematics uploaded yet.')}</p>
         ${!_listState.q ? '<p class="empty-hint"><a href="#/upload">Upload your first schematic</a></p>' : ''}
       </div>`;
+    setListStatus('idle');
+    updateRailCount();
     return;
   }
 
-  let grid = '<div class="schematics-grid">';
-  for (const m of data.items) {
-    grid += `
-      <div class="schematic-card" data-id="${m.id}" data-href="#/schematic/${m.id}" tabindex="0">
-        <div class="card-head">
-          <div class="card-thumb">
-            <img class="card-thumb-img" alt="Preview of ${esc(m.name)}" />
-            <div class="card-thumb-loading"></div>
-          </div>
-          <div class="card-title-wrap">
-            <div class="card-name">${esc(m.name)}</div>
-            <div class="card-desc">${esc(m.description || m.fileName)}</div>
-          </div>
-        </div>
-        <div class="card-meta">
-          <span class="card-size">${fmtBytes(m.size)}</span>
-          <span class="card-owner">${esc(m.ownerName || 'anonymous')}</span>
-          <span class="card-date">${fmtDate(m.uploadDate)}</span>
-          <a href="${API.downloadUrl(m.id)}" class="button button-secondary button-sm card-download" download title="Download ${esc(m.fileName)}" onclick="event.stopPropagation()">Download</a>
-        </div>
-      </div>`;
+  // Only append newly-arrived cards so existing DOM (and their thumbnails)
+  // stay intact while infinite scrolling.
+  let grid = el.querySelector('.schematics-grid');
+  if (!grid) {
+    el.innerHTML = '<div class="schematics-grid"></div>';
+    grid = el.querySelector('.schematics-grid');
+    _listRendered = 0;
   }
-  grid += '</div>';
+  const fresh = _listItems.slice(_listRendered);
+  if (fresh.length) grid.insertAdjacentHTML('beforeend', fresh.map(cardHtml).join(''));
+  const cards = Array.from(grid.querySelectorAll('.schematic-card')).slice(_listRendered);
+  mountListCards(cards);
+  _listRendered = _listItems.length;
+  updateRailCount();
 
-  // pagination lives in the fixed right-hand rail
-  const totalPages = Math.ceil(data.total / _listState.limit) || 1;
-  const curPage = Math.floor(data.offset / _listState.limit) + 1;
-  const hasPrev = data.offset > 0;
-  const hasNext = data.offset + data.items.length < data.total;
-  const pagination = document.getElementById('rail-pagination');
-  if (pagination) {
-    pagination.innerHTML = `
-      <div class="pagination">
-        <button class="rail-btn" id="pg-prev" title="Previous page" aria-label="Previous page" ${!hasPrev ? 'disabled' : ''}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 15l-6-6-6 6"/></svg>
-        </button>
-        <span class="page-info" title="${data.total} total">${curPage}/${totalPages}</span>
-        <button class="rail-btn" id="pg-next" title="Next page" aria-label="Next page" ${!hasNext ? 'disabled' : ''}>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
-        </button>
-      </div>`;
-  }
-
-  el.innerHTML = grid;
-
-  el.querySelectorAll('.schematic-card').forEach(card => {
-    const go = () => { location.hash = card.dataset.href; };
-    card.addEventListener('click', go);
-    card.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
-  });
-
-  // Kick off lazy 3D thumbnails.
-  if (previewsSupported()) {
-    const obs = thumbObserver();
-    el.querySelectorAll('.schematic-card').forEach(card => obs.observe(card));
+  if (_listItems.length < _listTotal) {
+    setListStatus('idle');
   } else {
-    el.querySelectorAll('.card-thumb').forEach(t => t.classList.add('thumb-error'));
+    setListStatus('end', `Showing all ${_listTotal} schematic${_listTotal === 1 ? '' : 's'}`);
   }
-
-  document.getElementById('pg-prev')?.addEventListener('click', () => {
-    _listState.offset = Math.max(0, _listState.offset - _listState.limit);
-    loadList();
-  });
-  document.getElementById('pg-next')?.addEventListener('click', () => {
-    _listState.offset = _listState.offset + _listState.limit;
-    loadList();
-  });
 }
 
 // ───────────────────────────────────────────────────────────────

@@ -354,14 +354,15 @@ a:hover { color: #93c5fd; }
 .rail-btn.active { color: #bfdbfe; border-color: rgba(96,165,250,.5); background: rgba(59,130,246,.15); }
 .rail-order-icon { transition: transform .18s; }
 .rail-btn.asc .rail-order-icon { transform: rotate(180deg); }
-.browse-rail-pagination { display: flex; flex-direction: column; gap: .45rem; }
-.browse-rail-pagination .pagination {
-  margin: 0;
-  flex-direction: column;
-  gap: .45rem;
+.browse-rail-count {
+  margin-top: auto;
+  padding-top: .1rem;
+  text-align: center;
+  font-size: .5rem;
+  color: #64748b;
+  line-height: 1.4;
+  word-break: break-all;
 }
-.browse-rail-pagination .rail-btn { width: 100%; }
-.browse-rail-pagination .page-info { font-size: .5rem; padding: 0; line-height: 1.6; }
 
 /* ── Schematic cards (square panels) ───────────────────────── */
 .schematics-grid {
@@ -700,19 +701,29 @@ a:hover { color: #93c5fd; }
 .empty-text { font-size: .6rem; line-height: 1.9; }
 .empty-hint { font-size: .52rem; margin-top: .5rem; line-height: 1.9; }
 
-/* ── Pagination ────────────────────────────────────────────── */
-.pagination {
+/* ── Infinite scroll (virtual pagination) ──────────────────── */
+.list-sentinel { height: 1px; }
+.list-status {
   display: flex;
   align-items: center;
   justify-content: center;
   gap: .5rem;
   margin-top: 1.25rem;
+  padding: .75rem 0;
   font-size: .55rem;
   color: #64748b;
   line-height: 1.6;
 }
-.pagination .button { font-size: .55rem; padding: .4rem .65rem; }
-.page-info { padding: 0 .5rem; }
+.list-status-error { color: #ef4444; }
+.list-spinner {
+  width: .85rem;
+  height: .85rem;
+  border-radius: 50%;
+  border: 2px solid rgba(148,163,184,.3);
+  border-top-color: #93c5fd;
+  animation: listSpin .7s linear infinite;
+}
+@keyframes listSpin { to { transform: rotate(360deg); } }
 
 /* ── Toast ─────────────────────────────────────────────────── */
 #toast-container {
@@ -855,9 +866,7 @@ a:hover { color: #93c5fd; }
     padding: .55rem;
   }
   .browse-rail .rail-btn { width: 2.4rem; flex: 0 0 auto; }
-  .browse-rail-pagination { margin-left: auto; flex-direction: row; }
-  .browse-rail-pagination .pagination { flex-direction: row; }
-  .browse-rail-pagination .rail-btn { width: 2.4rem; }
+  .browse-rail-count { margin: 0 0 0 auto; padding: 0; }
 
   .detail-layout {
     grid-template-columns: 1fr;
