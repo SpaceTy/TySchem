@@ -153,17 +153,6 @@ function closeProfileMenus(e) {
 document.addEventListener('click', closeProfileMenus);
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeProfileMenus(); });
 
-function closeBrowseSearch() {
-  document.querySelectorAll('.browse-rail.search-open').forEach(rail => rail.classList.remove('search-open'));
-}
-document.addEventListener('click', e => {
-  document.querySelectorAll('.browse-rail.search-open').forEach(rail => {
-    if (e.target && rail.contains(e.target)) return;
-    rail.classList.remove('search-open');
-  });
-});
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeBrowseSearch(); });
-
 async function doLogout() {
   try { await API.logout(); } catch {}
   currentUser = null;
@@ -185,21 +174,85 @@ function toast(msg, type = 'success') {
 }
 
 // ───────────────────────────────────────────────────────────────
-//  Confirm dialog (returns Promise<boolean>)
+//  Anchored popovers (grow out of the button that opened them)
 // ───────────────────────────────────────────────────────────────
-let _confirmResolve = null;
-function confirm(title, message, confirmLabel = 'Delete') {
+function positionPopover(pop, anchor) {
+  const rail = anchor.closest('.detail-rail');
+  const a = anchor.getBoundingClientRect();
+  const o = rail ? rail.getBoundingClientRect() : a;
+  const pw = pop.offsetWidth;
+  const ph = pop.offsetHeight;
+  const gap = 12;
+  let side = 'right';
+  let left = a.left - pw - gap;
+  if (left < 8) { left = a.right + gap; side = 'left'; }
+  if (left + pw > window.innerWidth - 8) left = window.innerWidth - pw - 8;
+  let top = o.top;
+  top = Math.max(8, Math.min(top, window.innerHeight - ph - 8));
+  const caretY = a.top + a.height / 2 - top;
+  pop.style.left = left + 'px';
+  pop.style.top = top + 'px';
+  pop.style.setProperty('--caret-y', caretY + 'px');
+  pop.dataset.side = side;
+  pop.style.transformOrigin = `${side === 'right' ? '100%' : '0'} 0`;
+}
+
+function createPopover(anchor, contentHtml, onClose, extraClass) {
+  if (anchor.__popover) anchor.__popover.close();
+  const pop = document.createElement('div');
+  pop.className = 'action-popover' + (extraClass ? ' ' + extraClass : '');
+  pop.innerHTML = contentHtml;
+  document.body.appendChild(pop);
+  positionPopover(pop, anchor);
+
+  let closed = false;
+  function close() {
+    if (closed) return;
+    closed = true;
+    if (anchor.__popover === api) anchor.__popover = null;
+    pop.classList.remove('open');
+    document.removeEventListener('pointerdown', onDocDown, true);
+    document.removeEventListener('keydown', onKey);
+    window.removeEventListener('resize', reposition);
+    window.removeEventListener('scroll', reposition, true);
+    const done = () => pop.remove();
+    pop.addEventListener('transitionend', done, { once: true });
+    setTimeout(done, 260);
+    onClose?.();
+  }
+  function onDocDown(e) {
+    if (pop.contains(e.target) || anchor.contains(e.target)) return;
+    close();
+  }
+  function onKey(e) { if (e.key === 'Escape') close(); }
+  function reposition() { positionPopover(pop, anchor); }
+
+  document.addEventListener('pointerdown', onDocDown, true);
+  document.addEventListener('keydown', onKey);
+  window.addEventListener('resize', reposition);
+  window.addEventListener('scroll', reposition, true);
+  requestAnimationFrame(() => pop.classList.add('open'));
+  const api = { pop, close };
+  anchor.__popover = api;
+  return api;
+}
+
+// Confirm dialog anchored to a button; returns Promise<boolean>.
+function confirm(anchor, title, message, confirmLabel = 'Delete') {
   return new Promise(resolve => {
-    _confirmResolve = resolve;
-    document.getElementById('confirm-title').textContent = title;
-    document.getElementById('confirm-message').textContent = message;
-    document.getElementById('confirm-ok').textContent = confirmLabel;
-    document.getElementById('confirm-overlay').hidden = false;
+    let done = false;
+    const finish = v => { if (!done) { done = true; resolve(v); } };
+    const { pop, close } = createPopover(anchor, `
+      <h3 class="dialog-title">${esc(title)}</h3>
+      <p class="dialog-message">${esc(message)}</p>
+      <div class="dialog-actions">
+        <button type="button" class="button button-secondary" data-act="cancel">Cancel</button>
+        <button type="button" class="button button-danger" data-act="ok">${esc(confirmLabel)}</button>
+      </div>`, () => finish(false));
+    pop.querySelector('[data-act="cancel"]').addEventListener('click', () => { close(); finish(false); });
+    pop.querySelector('[data-act="ok"]').addEventListener('click', () => { finish(true); close(); });
   });
 }
-document.getElementById('confirm-ok').onclick = () => { document.getElementById('confirm-overlay').hidden = true; _confirmResolve?.(true); };
-document.getElementById('confirm-cancel').onclick = () => { document.getElementById('confirm-overlay').hidden = true; _confirmResolve?.(false); };
-document.getElementById('confirm-overlay').onclick = e => { if (e.target.id === 'confirm-overlay') { e.currentTarget.hidden = true; _confirmResolve?.(false); } };
 
 // ───────────────────────────────────────────────────────────────
 //  Utilities
@@ -426,7 +479,7 @@ async function mountDetailViewer(container, id) {
   function resize() {
     if (state.disposed) return;
     const w = Math.max(container.clientWidth, 1);
-    const h = Math.max(Math.round(w * 0.62), 180);
+    const h = Math.max(container.clientHeight, 180);
     renderer.setViewport(0, 0, w, h, Math.min(window.devicePixelRatio || 1, 2));
   }
   resize();
@@ -529,6 +582,11 @@ function route() {
   _currentAbort = new AbortController();
   if (_viewCleanup) { try { _viewCleanup(); } catch {} _viewCleanup = null; }
   $view.classList.remove('view-wide');
+  document.body.classList.remove('detail-view');
+  const navSub = document.getElementById('nav-sub');
+  if (navSub) { navSub.hidden = true; }
+  const navSubText = document.getElementById('nav-sub-text');
+  if (navSubText) navSubText.textContent = '';
 
   const hash = location.hash.slice(1) || '/';
   const parts = hash.split('/').filter(Boolean);
@@ -543,7 +601,6 @@ function route() {
   if (parts[0] === 'login' || parts[0] === 'register') { renderAuth(); return; }
   if (parts[0] === 'mine') { renderList({ owner: 'me', offset: 0 }); return; }
   if (parts[0] === 'upload') { renderUpload(); return; }
-  if (parts[0] === 'schematic' && parts[1] && parts[2] === 'edit') { renderEdit(parts[1]); return; }
   if (parts[0] === 'schematic' && parts[1]) { renderDetail(parts[1]); return; }
   $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Not found</h2></div>';
 }
@@ -574,14 +631,13 @@ async function renderList(overrides = {}) {
 
   const sortLabel = { uploadDate: 'Upload date', updatedDate: 'Updated date', name: 'Name', size: 'Size' }[s.sort] || s.sort;
   let html = `
-    <div class="fade-in">
+    <div class="browse-view">
       <h2 class="page-title">${mine ? 'My Uploads' : 'Schematics'}</h2>
       <div class="browse-layout">
         <aside class="browse-rail">
-          <button type="button" class="rail-btn" id="search-toggle" title="Search" aria-label="Search">
+          <button type="button" class="rail-btn ${s.q ? 'active' : ''}" id="search-btn" title="Search" aria-label="Search">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
           </button>
-          <input class="input rail-search" id="search-input" placeholder="Search..." value="${esc(s.q)}" />
           <button type="button" class="rail-btn" id="sort-btn" title="Sort: ${sortLabel}" aria-label="Change sort">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18M6 12h12M10 18h4"/></svg>
           </button>
@@ -590,7 +646,7 @@ async function renderList(overrides = {}) {
           </button>
           <div class="browse-rail-pagination" id="rail-pagination"></div>
         </aside>
-        <div class="browse-main">
+        <div class="browse-main fade-in">
           <div id="list-body"><div class="empty-state"><div class="empty-icon">...</div><p class="empty-text">Loading...</p></div></div>
         </div>
       </div>
@@ -598,26 +654,23 @@ async function renderList(overrides = {}) {
   $view.classList.add('view-wide');
   $view.innerHTML = html;
 
-  // events
-  let searchTimer;
-  const railEl = document.querySelector('.browse-rail');
-  document.getElementById('search-toggle').addEventListener('click', () => {
-    const open = railEl.classList.toggle('search-open');
-    if (open) document.getElementById('search-input').focus();
-  });
-  document.getElementById('search-input').addEventListener('input', e => {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => renderList({ q: e.target.value, offset: 0 }), 280);
-  });
-  const sortOrder = ['uploadDate', 'updatedDate', 'name', 'size'];
-  document.getElementById('sort-btn').addEventListener('click', () => {
-    renderList({ sort: sortOrder[(sortOrder.indexOf(s.sort) + 1) % sortOrder.length], offset: 0 });
-  });
-  document.getElementById('order-btn').addEventListener('click', () => {
-    renderList({ order: s.order === 'desc' ? 'asc' : 'desc', offset: 0 });
-  });
+  const withPopover = (id, open) => {
+    const btn = document.getElementById(id);
+    btn.addEventListener('click', e => {
+      const el = e.currentTarget;
+      if (el.__popover) { el.__popover.close(); return; }
+      open(el);
+    });
+  };
+  withPopover('search-btn', openSearchPopover);
+  withPopover('sort-btn', openSortPopover);
+  withPopover('order-btn', openOrderPopover);
 
-  // fetch
+  await loadList();
+}
+
+async function loadList() {
+  const s = _listState;
   try {
     const data = await API.list({ q: s.q, sort: s.sort, order: s.order, limit: s.limit, offset: s.offset, owner: s.owner });
     renderListBody(data);
@@ -625,6 +678,52 @@ async function renderList(overrides = {}) {
     if (err.name === 'AbortError') return;
     document.getElementById('list-body').innerHTML = '<div class="empty-state"><p class="empty-text" style="color:#ef4444">Failed to load schematics.</p></div>';
   }
+}
+
+// ── Browse rail popovers (styled like the detail-page popovers) ─
+function openSearchPopover(anchor) {
+  const { pop } = createPopover(anchor, `
+    <h3 class="dialog-title">Search</h3>
+    <input class="input" id="pop-search-input" placeholder="Search schematics..." value="${esc(_listState.q)}" />`, null, 'action-popover-menu');
+  const input = pop.querySelector('#pop-search-input');
+  let timer;
+  input.addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      _listState.q = input.value;
+      _listState.offset = 0;
+      document.getElementById('search-btn')?.classList.toggle('active', !!_listState.q);
+      loadList();
+    }, 280);
+  });
+  input.focus();
+  input.setSelectionRange(input.value.length, input.value.length);
+}
+
+function openSortPopover(anchor) {
+  const options = [['uploadDate', 'Upload date'], ['updatedDate', 'Updated date'], ['name', 'Name'], ['size', 'Size']];
+  const { pop, close } = createPopover(anchor, `
+    <h3 class="dialog-title">Sort by</h3>
+    <div class="popover-menu">
+      ${options.map(([v, l]) => `<button type="button" class="popover-item ${_listState.sort === v ? 'active' : ''}" data-value="${v}">${l}</button>`).join('')}
+    </div>`, null, 'action-popover-menu');
+  pop.querySelectorAll('.popover-item').forEach(item => item.addEventListener('click', () => {
+    close();
+    renderList({ sort: item.dataset.value, offset: 0 });
+  }));
+}
+
+function openOrderPopover(anchor) {
+  const { pop, close } = createPopover(anchor, `
+    <h3 class="dialog-title">Order</h3>
+    <div class="popover-menu">
+      <button type="button" class="popover-item ${_listState.order === 'desc' ? 'active' : ''}" data-value="desc">Newest first</button>
+      <button type="button" class="popover-item ${_listState.order === 'asc' ? 'active' : ''}" data-value="asc">Oldest first</button>
+    </div>`, null, 'action-popover-menu');
+  pop.querySelectorAll('.popover-item').forEach(item => item.addEventListener('click', () => {
+    close();
+    renderList({ order: item.dataset.value, offset: 0 });
+  }));
 }
 
 function renderListBody(data) {
@@ -700,10 +799,12 @@ function renderListBody(data) {
   }
 
   document.getElementById('pg-prev')?.addEventListener('click', () => {
-    renderList({ offset: Math.max(0, _listState.offset - _listState.limit) });
+    _listState.offset = Math.max(0, _listState.offset - _listState.limit);
+    loadList();
   });
   document.getElementById('pg-next')?.addEventListener('click', () => {
-    renderList({ offset: _listState.offset + _listState.limit });
+    _listState.offset = _listState.offset + _listState.limit;
+    loadList();
   });
 }
 
@@ -823,42 +924,68 @@ async function renderDetail(id) {
     return;
   }
 
-  const editHash = '#/schematic/' + id + '/edit';
   const dlUrl    = API.downloadUrl(id);
   const owner    = canManage(meta);
 
+  $view.classList.add('view-wide');
+  document.body.classList.add('detail-view');
+  const navSub = document.getElementById('nav-sub');
+  if (navSub) {
+    const navSubText = document.getElementById('nav-sub-text');
+    if (navSubText) navSubText.textContent = meta.name;
+    navSub.hidden = false;
+  }
   $view.innerHTML = `
-    <div class="fade-in">
-      <div class="panel detail-panel">
+    <div class="fade-in detail-layout">
+      <div class="panel detail-info">
         <h2 class="page-title detail-name">${esc(meta.name)}</h2>
         ${meta.description ? '<p class="detail-description">' + esc(meta.description) + '</p>' : ''}
-        <div class="detail-actions">
-          <a href="${dlUrl}" class="button button-primary" download>Download</a>
-          ${owner ? `<a href="${editHash}" class="button button-secondary">Edit</a>
-          <button class="button button-danger" id="detail-delete">Delete</button>` : ''}
+        <div class="meta-grid">
+          <div class="meta-item"><span class="meta-label">Uploader</span><span class="meta-value">${esc(meta.ownerName || 'anonymous')}</span></div>
+          <div class="meta-item"><span class="meta-label">File Size</span><span class="meta-value">${fmtBytes(meta.size)}</span></div>
+          <div class="meta-item"><span class="meta-label">Uploaded</span><span class="meta-value">${fmtDateTime(meta.uploadDate)}</span></div>
         </div>
+        <details class="meta-advanced">
+          <summary>Advanced</summary>
+          <div class="meta-grid">
+            <div class="meta-item"><span class="meta-label">ID</span><span class="meta-value">${esc(meta.id)}</span></div>
+            <div class="meta-item"><span class="meta-label">Original File</span><span class="meta-value">${esc(meta.fileName)}</span></div>
+            <div class="meta-item"><span class="meta-label">Content Type</span><span class="meta-value">${esc(meta.contentType)}</span></div>
+            <div class="meta-item"><span class="meta-label">Last Updated</span><span class="meta-value">${fmtDateTime(meta.updatedDate)}</span></div>
+          </div>
+        </details>
       </div>
-      <div class="panel viewer-panel">
-        <div class="viewer-container" id="detail-viewer">
-          <div class="viewer-loading">Loading 3D preview&hellip;</div>
+      <div class="detail-stage">
+        <aside class="detail-rail" aria-label="Actions">
+          <a href="${dlUrl}" class="rail-btn" download title="Download" aria-label="Download">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
+          </a>
+          ${owner ? `<button type="button" class="rail-btn" id="detail-edit" title="Edit" aria-label="Edit">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+          </button>
+          <button type="button" class="rail-btn rail-btn-danger" id="detail-delete" title="Delete" aria-label="Delete">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+          </button>` : ''}
+        </aside>
+        <div class="panel viewer-panel">
+          <div class="viewer-container" id="detail-viewer">
+            <div class="viewer-loading">Loading 3D preview&hellip;</div>
+          </div>
         </div>
         <div class="viewer-hint">Drag to rotate &middot; scroll to zoom</div>
       </div>
-      <div class="panel">
-        <div class="meta-grid">
-          <div class="meta-item"><span class="meta-label">ID</span><span class="meta-value">${esc(meta.id)}</span></div>
-          <div class="meta-item"><span class="meta-label">Uploader</span><span class="meta-value">${esc(meta.ownerName || 'anonymous')}</span></div>
-          <div class="meta-item"><span class="meta-label">Original File</span><span class="meta-value">${esc(meta.fileName)}</span></div>
-          <div class="meta-item"><span class="meta-label">File Size</span><span class="meta-value">${fmtBytes(meta.size)}</span></div>
-          <div class="meta-item"><span class="meta-label">Content Type</span><span class="meta-value">${esc(meta.contentType)}</span></div>
-          <div class="meta-item"><span class="meta-label">Uploaded</span><span class="meta-value">${fmtDateTime(meta.uploadDate)}</span></div>
-          <div class="meta-item"><span class="meta-label">Last Updated</span><span class="meta-value">${fmtDateTime(meta.updatedDate)}</span></div>
-        </div>
-      </div>
     </div>`;
 
-  document.getElementById('detail-delete')?.addEventListener('click', async () => {
-    const ok = await confirm('Delete Schematic', `Are you sure you want to delete "${meta.name}"? This cannot be undone.`);
+  document.getElementById('detail-edit')?.addEventListener('click', e => {
+    const btn = e.currentTarget;
+    if (btn.__popover) { btn.__popover.close(); return; }
+    openEditPopover(btn, meta, id);
+  });
+
+  document.getElementById('detail-delete')?.addEventListener('click', async e => {
+    const btn = e.currentTarget;
+    if (btn.__popover) { btn.__popover.close(); return; }
+    const ok = await confirm(btn, 'Delete Schematic', `Are you sure you want to delete "${meta.name}"? This cannot be undone.`);
     if (!ok) return;
     try {
       await API.remove(id);
@@ -873,73 +1000,47 @@ async function renderDetail(id) {
 }
 
 // ───────────────────────────────────────────────────────────────
-//  Edit view
+//  Edit popover (anchored to the edit button)
 // ───────────────────────────────────────────────────────────────
-async function renderEdit(id) {
-  if (!currentUser) {
-    $view.innerHTML = `
-      <div class="fade-in">
-        <h2 class="page-title">Edit Schematic</h2>
-        <div class="panel empty-state">
-          <div class="empty-icon">&#128274;</div>
-          <p class="empty-text">You need an account to edit schematics.</p>
-          <p class="empty-hint"><a href="#/login">Sign in</a> to continue.</p>
-        </div>
-      </div>`;
-    return;
-  }
-
-  $view.innerHTML = '<div class="panel fade-in"><div class="empty-state"><p class="empty-text">Loading...</p></div></div>';
-
-  let meta;
-  try { meta = await API.get(id); } catch {
-    $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Schematic not found</h2><a href="#/" class="button button-secondary">Back to list</a></div>';
-    return;
-  }
-  if (!canManage(meta)) {
-    $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Not allowed</h2><p class="empty-text">You do not own this schematic.</p><a href="#/schematic/' + id + '" class="button button-secondary">Back</a></div>';
-    return;
-  }
-
-  $view.innerHTML = `
-    <div class="fade-in">
-      <h2 class="page-title">Edit Schematic</h2>
-      <div class="panel">
-        <form id="edit-form" autocomplete="off">
-          <div class="form-group">
-            <label class="label" for="edit-name">Name</label>
-            <input class="input" id="edit-name" value="${esc(meta.name)}" maxlength="200" required />
-          </div>
-          <div class="form-group">
-            <label class="label" for="edit-desc">Description</label>
-            <textarea class="textarea" id="edit-desc" maxlength="5000">${esc(meta.description)}</textarea>
-          </div>
-          <div style="display:flex;gap:.6rem;margin-top:1rem">
-            <button type="submit" class="button button-primary" id="edit-btn">Save Changes</button>
-            <a href="#/schematic/${id}" class="button button-secondary">Cancel</a>
-          </div>
-        </form>
+function openEditPopover(anchor, meta, id) {
+  const { pop, close } = createPopover(anchor, `
+    <h3 class="dialog-title">Edit Schematic</h3>
+    <form id="edit-popover-form" autocomplete="off">
+      <div class="form-group">
+        <label class="label" for="pop-edit-name">Name</label>
+        <input class="input" id="pop-edit-name" value="${esc(meta.name)}" maxlength="200" required />
       </div>
-    </div>`;
+      <div class="form-group">
+        <label class="label" for="pop-edit-desc">Description</label>
+        <textarea class="textarea" id="pop-edit-desc" maxlength="5000">${esc(meta.description || '')}</textarea>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" class="button button-secondary" data-act="cancel">Cancel</button>
+        <button type="submit" class="button button-primary" data-act="save">Save Changes</button>
+      </div>
+    </form>`);
 
-  document.getElementById('edit-form').addEventListener('submit', async e => {
+  pop.querySelector('[data-act="cancel"]').addEventListener('click', close);
+  pop.querySelector('#edit-popover-form').addEventListener('submit', async e => {
     e.preventDefault();
-    const btn = document.getElementById('edit-btn');
+    const btn = pop.querySelector('[data-act="save"]');
     btn.disabled = true;
     btn.textContent = 'Saving...';
     try {
       await API.update(id, {
-        name: document.getElementById('edit-name').value.trim(),
-        description: document.getElementById('edit-desc').value.trim(),
+        name: pop.querySelector('#pop-edit-name').value.trim(),
+        description: pop.querySelector('#pop-edit-desc').value.trim(),
       });
       toast('Schematic updated');
-      location.hash = '#/schematic/' + id;
+      close();
+      route();
     } catch (err) {
       toast(err.message || 'Update failed', 'error');
       btn.disabled = false;
       btn.textContent = 'Save Changes';
     }
   });
+  pop.querySelector('#pop-edit-name')?.focus();
 }
 
 // ───────────────────────────────────────────────────────────────
