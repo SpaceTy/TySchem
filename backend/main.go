@@ -40,6 +40,10 @@ func main() {
 		log.Fatalf("init schematic store: %v", err)
 	}
 	defer store.Close()
+	if err := store.DeleteExpiredSessions(); err != nil {
+		log.Printf("prune sessions: %v", err)
+	}
+	registerAuthRoutes(mux, store)
 	registerSchematicRoutes(mux, store)
 
 	// Static frontend with SPA fallback
@@ -69,7 +73,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:         ":" + port,
-		Handler:      withLogging(mux),
+		Handler:      withSecurityHeaders(withLogging(mux)),
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -101,5 +105,14 @@ func withLogging(next http.Handler) http.Handler {
 		start := time.Now()
 		next.ServeHTTP(w, r)
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
+	})
+}
+
+func withSecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "same-origin")
+		w.Header().Set("X-Frame-Options", "DENY")
+		next.ServeHTTP(w, r)
 	})
 }

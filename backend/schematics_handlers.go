@@ -31,7 +31,11 @@ func registerSchematicRoutes(mux *http.ServeMux, store *Store) {
 	mux.HandleFunc("/api/schematics", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
-			handleSchematicUpload(w, r, store)
+			user, ok := requireUser(w, r, store)
+			if !ok {
+				return
+			}
+			handleSchematicUpload(w, r, store, user)
 		case http.MethodGet:
 			handleSchematicList(w, r, store)
 		default:
@@ -57,9 +61,17 @@ func registerSchematicRoutes(mux *http.ServeMux, store *Store) {
 			case http.MethodGet:
 				handleSchematicGet(w, r, store, id)
 			case http.MethodPut, http.MethodPatch:
-				handleSchematicUpdate(w, r, store, id)
+				user, ok := requireUser(w, r, store)
+				if !ok {
+					return
+				}
+				handleSchematicUpdate(w, r, store, id, user)
 			case http.MethodDelete:
-				handleSchematicDelete(w, r, store, id)
+				user, ok := requireUser(w, r, store)
+				if !ok {
+					return
+				}
+				handleSchematicDelete(w, r, store, id, user)
 			default:
 				w.Header().Set("Allow", "GET, PUT, PATCH, DELETE")
 				writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -77,9 +89,9 @@ func registerSchematicRoutes(mux *http.ServeMux, store *Store) {
 	})
 }
 
-// POST /api/schematics (multipart/form-data)
+// POST /api/schematics (multipart/form-data, authenticated)
 // Fields: file (required, *.litematic), name (optional), description (optional).
-func handleSchematicUpload(w http.ResponseWriter, r *http.Request, store *Store) {
+func handleSchematicUpload(w http.ResponseWriter, r *http.Request, store *Store, user User) {
 	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadSize+10<<20)
 	if err := r.ParseMultipartForm(MaxUploadSize); err != nil {
 		writeErr(w, http.StatusBadRequest, "failed to parse multipart form (max 50 MiB): "+err.Error())
@@ -132,11 +144,12 @@ func handleSchematicUpload(w http.ResponseWriter, r *http.Request, store *Store)
 		return
 	}
 
-	meta, err := store.Create(name, description, origName, data)
+	meta, err := store.Create(user.ID, name, description, origName, data)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to store schematic")
 		return
 	}
+	meta.OwnerName = user.Username
 	writeJSON(w, http.StatusCreated, meta)
 }
 
@@ -151,6 +164,18 @@ func handleSchematicList(w http.ResponseWriter, r *http.Request, store *Store) {
 		Description: q.Get("description"),
 		Sort:        q.Get("sort"),
 		Order:       q.Get("order"),
+	}
+	if owner := q.Get("owner"); owner != "" {
+		if owner != "me" {
+			writeErr(w, http.StatusBadRequest, "invalid owner (want me)")
+			return
+		}
+		user, ok := currentUser(r, store)
+		if !ok {
+			writeErr(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		f.OwnerID = user.ID
 	}
 	if f.Sort == "" {
 		f.Sort = "uploadDate"
@@ -250,8 +275,18 @@ func handleSchematicFile(w http.ResponseWriter, r *http.Request, store *Store, i
 	http.ServeFile(w, r, path)
 }
 
-// PUT/PATCH /api/schematics/{id} — JSON {"name"?,"description"?} updates metadata.
-func handleSchematicUpdate(w http.ResponseWriter, r *http.Request, store *Store, id string) {
+// PUT/PATCH /api/schematics/{id} — JSON {"name"?,"description"?} updates metadata (owner only).
+func handleSchematicUpdate(w http.ResponseWriter, r *http.Request, store *Store, id string, user User) {
+	meta, err := store.Get(id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "schematic not found")
+		return
+	}
+	if !CanManage(meta, user) {
+		writeErr(w, http.StatusForbidden, "you do not own this schematic")
+		return
+	}
+
 	var body struct {
 		Name        *string `json:"name"`
 		Description *string `json:"description"`
@@ -279,16 +314,25 @@ func handleSchematicUpdate(w http.ResponseWriter, r *http.Request, store *Store,
 		writeErr(w, http.StatusBadRequest, "nothing to update (want name and/or description)")
 		return
 	}
-	meta, err := store.Update(id, body.Name, body.Description)
+	updated, err := store.Update(id, body.Name, body.Description)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "schematic not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, meta)
+	writeJSON(w, http.StatusOK, updated)
 }
 
-// DELETE /api/schematics/{id} — removes blob + metadata.
-func handleSchematicDelete(w http.ResponseWriter, _ *http.Request, store *Store, id string) {
+// DELETE /api/schematics/{id} — removes blob + metadata (owner only).
+func handleSchematicDelete(w http.ResponseWriter, _ *http.Request, store *Store, id string, user User) {
+	meta, err := store.Get(id)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "schematic not found")
+		return
+	}
+	if !CanManage(meta, user) {
+		writeErr(w, http.StatusForbidden, "you do not own this schematic")
+		return
+	}
 	if err := store.Delete(id); err != nil {
 		writeErr(w, http.StatusNotFound, "schematic not found")
 		return

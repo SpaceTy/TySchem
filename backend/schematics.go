@@ -24,6 +24,8 @@ type SchematicMetadata struct {
 	FileName    string    `json:"fileName"` // original upload filename
 	Size        int64     `json:"size"`     // bytes on disk
 	ContentType string    `json:"contentType"`
+	OwnerID     string    `json:"ownerId,omitempty"`   // empty for legacy/anonymous uploads
+	OwnerName   string    `json:"ownerName,omitempty"` // joined from users
 	UploadDate  time.Time `json:"uploadDate"`
 	UpdatedDate time.Time `json:"updatedDate"`
 }
@@ -33,6 +35,7 @@ type ListFilter struct {
 	Query       string     // substring match against name + description + fileName
 	Name        string     // substring match against name
 	Description string     // substring match against description
+	OwnerID     string     // exact owner match (used for "my schematics")
 	From        *time.Time // uploadDate >= From
 	To          *time.Time // uploadDate <= To
 	Sort        string     // "uploadDate" (default) | "updatedDate" | "name" | "size"
@@ -51,11 +54,26 @@ CREATE TABLE IF NOT EXISTS schematics (
 	file_name    TEXT NOT NULL,
 	size         INTEGER NOT NULL,
 	content_type TEXT NOT NULL,
+	owner_id     TEXT,
 	upload_date  TEXT NOT NULL,
 	updated_date TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_schematics_name ON schematics(name);
 CREATE INDEX IF NOT EXISTS idx_schematics_upload_date ON schematics(upload_date);
+CREATE TABLE IF NOT EXISTS users (
+	id            TEXT PRIMARY KEY,
+	username      TEXT NOT NULL COLLATE NOCASE UNIQUE,
+	password_hash TEXT NOT NULL,
+	created_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+	token      TEXT PRIMARY KEY,
+	user_id    TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 `
 
 // Store persists schematic blobs on disk and their metadata in SQLite:
@@ -97,7 +115,46 @@ func NewStore(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("init sqlite schema: %w", err)
 	}
-	return &Store{db: db, filesDir: filesDir}, nil
+	s := &Store{db: db, filesDir: filesDir}
+	// Migration: databases created before accounts existed lack owner_id.
+	if err := s.ensureColumn("schematics", "owner_id", "TEXT"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate schematics.owner_id: %w", err)
+	}
+	// Index creation must come after the column exists.
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_schematics_owner ON schematics(owner_id)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("index schematics.owner_id: %w", err)
+	}
+	return s, nil
+}
+
+// ensureColumn adds a column to a table if it does not already exist.
+// table/column names are internal constants, never user input.
+func (s *Store) ensureColumn(table, column, decl string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid, notNull, pk int
+			name, colType    string
+			dflt             sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + decl)
+	return err
 }
 
 // Close releases the SQLite connection. Call on shutdown.
@@ -110,6 +167,12 @@ func (s *Store) FilePath(id string) string {
 }
 
 var ErrNotFound = errors.New("schematic not found")
+
+// CanManage reports whether user u may edit or delete meta.
+// Legacy uploads with no owner are manageable by any authenticated user.
+func CanManage(meta SchematicMetadata, u User) bool {
+	return meta.OwnerID == "" || meta.OwnerID == u.ID
+}
 
 func validID(id string) bool {
 	if len(id) == 0 || len(id) > 64 {
@@ -158,15 +221,19 @@ func scanMetadata(row interface {
 }) (SchematicMetadata, error) {
 	var m SchematicMetadata
 	var uploadDate, updatedDate string
+	var ownerID, ownerName sql.NullString
 	if err := row.Scan(
 		&m.ID, &m.Name, &m.Description, &m.FileName,
 		&m.Size, &m.ContentType, &uploadDate, &updatedDate,
+		&ownerID, &ownerName,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return SchematicMetadata{}, ErrNotFound
 		}
 		return SchematicMetadata{}, err
 	}
+	m.OwnerID = ownerID.String
+	m.OwnerName = ownerName.String
 	var err error
 	if m.UploadDate, err = parseTime(uploadDate); err != nil {
 		return SchematicMetadata{}, err
@@ -177,10 +244,12 @@ func scanMetadata(row interface {
 	return m, nil
 }
 
-const metaColumns = "id, name, description, file_name, size, content_type, upload_date, updated_date"
+const metaColumns = "s.id, s.name, s.description, s.file_name, s.size, s.content_type, s.upload_date, s.updated_date, s.owner_id, u.username"
 
-// Create stores a new schematic blob + metadata row.
-func (s *Store) Create(name, description, fileName string, data []byte) (SchematicMetadata, error) {
+const metaFrom = "FROM schematics s LEFT JOIN users u ON u.id = s.owner_id"
+
+// Create stores a new schematic blob + metadata row owned by ownerID.
+func (s *Store) Create(ownerID, name, description, fileName string, data []byte) (SchematicMetadata, error) {
 	id := newID()
 	now := time.Now().UTC()
 	meta := SchematicMetadata{
@@ -190,6 +259,7 @@ func (s *Store) Create(name, description, fileName string, data []byte) (Schemat
 		FileName:    fileName,
 		Size:        int64(len(data)),
 		ContentType: "application/octet-stream",
+		OwnerID:     ownerID,
 		UploadDate:  now,
 		UpdatedDate: now,
 	}
@@ -198,9 +268,11 @@ func (s *Store) Create(name, description, fileName string, data []byte) (Schemat
 		return SchematicMetadata{}, err
 	}
 	_, err := s.db.Exec(
-		`INSERT INTO schematics (`+metaColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO schematics (id, name, description, file_name, size, content_type, owner_id, upload_date, updated_date)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		meta.ID, meta.Name, meta.Description, meta.FileName,
-		meta.Size, meta.ContentType, formatTime(meta.UploadDate), formatTime(meta.UpdatedDate),
+		meta.Size, meta.ContentType, nullIfEmpty(meta.OwnerID),
+		formatTime(meta.UploadDate), formatTime(meta.UpdatedDate),
 	)
 	if err != nil {
 		os.Remove(s.FilePath(id))
@@ -215,7 +287,7 @@ func (s *Store) Get(id string) (SchematicMetadata, error) {
 		return SchematicMetadata{}, ErrNotFound
 	}
 	meta, err := scanMetadata(s.db.QueryRow(
-		`SELECT `+metaColumns+` FROM schematics WHERE id = ?`, id,
+		`SELECT `+metaColumns+` `+metaFrom+` WHERE s.id = ?`, id,
 	))
 	if err != nil {
 		return SchematicMetadata{}, err
@@ -228,6 +300,13 @@ func (s *Store) Get(id string) (SchematicMetadata, error) {
 		return SchematicMetadata{}, err
 	}
 	return meta, nil
+}
+
+func nullIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // Update changes name and/or description. Pass nil for fields to leave untouched.
@@ -300,25 +379,29 @@ func whereClause(f ListFilter) (string, []any) {
 	var args []any
 	if q := strings.TrimSpace(f.Query); q != "" {
 		like := "%" + escapeLike(strings.ToLower(q)) + "%"
-		conds = append(conds, `(LOWER(name) LIKE ? ESCAPE '\' OR LOWER(description) LIKE ? ESCAPE '\' OR LOWER(file_name) LIKE ? ESCAPE '\')`)
+		conds = append(conds, `(LOWER(s.name) LIKE ? ESCAPE '\' OR LOWER(s.description) LIKE ? ESCAPE '\' OR LOWER(s.file_name) LIKE ? ESCAPE '\')`)
 		args = append(args, like, like, like)
 	}
 	if n := strings.TrimSpace(f.Name); n != "" {
 		like := "%" + escapeLike(strings.ToLower(n)) + "%"
-		conds = append(conds, `LOWER(name) LIKE ? ESCAPE '\'`)
+		conds = append(conds, `LOWER(s.name) LIKE ? ESCAPE '\'`)
 		args = append(args, like)
 	}
 	if d := strings.TrimSpace(f.Description); d != "" {
 		like := "%" + escapeLike(strings.ToLower(d)) + "%"
-		conds = append(conds, `LOWER(description) LIKE ? ESCAPE '\'`)
+		conds = append(conds, `LOWER(s.description) LIKE ? ESCAPE '\'`)
 		args = append(args, like)
 	}
+	if f.OwnerID != "" {
+		conds = append(conds, `s.owner_id = ?`)
+		args = append(args, f.OwnerID)
+	}
 	if f.From != nil {
-		conds = append(conds, `upload_date >= ?`)
+		conds = append(conds, `s.upload_date >= ?`)
 		args = append(args, formatTime(*f.From))
 	}
 	if f.To != nil {
-		conds = append(conds, `upload_date <= ?`)
+		conds = append(conds, `s.upload_date <= ?`)
 		args = append(args, formatTime(*f.To))
 	}
 	if len(conds) == 0 {
@@ -333,7 +416,7 @@ func (s *Store) List(f ListFilter) ([]SchematicMetadata, int, error) {
 	where, args := whereClause(f)
 
 	var total int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM schematics `+where, args...).Scan(&total); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(*) `+metaFrom+` `+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
@@ -341,21 +424,21 @@ func (s *Store) List(f ListFilter) ([]SchematicMetadata, int, error) {
 	var orderBy string
 	switch f.Sort {
 	case "name":
-		orderBy = "name COLLATE NOCASE"
+		orderBy = "s.name COLLATE NOCASE"
 	case "size":
-		orderBy = "size"
+		orderBy = "s.size"
 	case "updatedDate":
-		orderBy = "updated_date"
+		orderBy = "s.updated_date"
 	default: // "uploadDate"
-		orderBy = "upload_date"
+		orderBy = "s.upload_date"
 	}
 	order := "DESC"
 	if strings.EqualFold(f.Order, "asc") {
 		order = "ASC"
 	}
 	// Tie-break on ID for stable pagination.
-	query := `SELECT ` + metaColumns + ` FROM schematics ` + where +
-		` ORDER BY ` + orderBy + ` ` + order + `, id ASC`
+	query := `SELECT ` + metaColumns + ` ` + metaFrom + ` ` + where +
+		` ORDER BY ` + orderBy + ` ` + order + `, s.id ASC`
 
 	queryArgs := append([]any{}, args...)
 	if f.Limit > 0 {
@@ -387,12 +470,16 @@ func (s *Store) List(f ListFilter) ([]SchematicMetadata, int, error) {
 	for rows.Next() {
 		var m SchematicMetadata
 		var uploadDate, updatedDate string
+		var ownerID, ownerName sql.NullString
 		if err := rows.Scan(
 			&m.ID, &m.Name, &m.Description, &m.FileName,
 			&m.Size, &m.ContentType, &uploadDate, &updatedDate,
+			&ownerID, &ownerName,
 		); err != nil {
 			return nil, 0, err
 		}
+		m.OwnerID = ownerID.String
+		m.OwnerName = ownerName.String
 		if m.UploadDate, err = parseTime(uploadDate); err != nil {
 			return nil, 0, err
 		}

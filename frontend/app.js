@@ -24,7 +24,12 @@ const API = {
       xhr.open('POST', '/api/schematics');
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText));
-        else reject(new Error(xhr.responseText || 'upload failed'));
+        else {
+          if (xhr.status === 401 || xhr.status === 403) onUnauthorized();
+          let msg = xhr.responseText || 'upload failed';
+          try { msg = JSON.parse(xhr.responseText).error || msg; } catch {}
+          reject(new Error(msg));
+        }
       };
       xhr.onerror = () => reject(new Error('network error'));
       if (onProgress) xhr.upload.onprogress = e => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
@@ -37,15 +42,125 @@ const API = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
+    if (r.status === 401 || r.status === 403) { onUnauthorized(); throw new Error('not allowed'); }
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
   async remove(id) {
     const r = await fetch('/api/schematics/' + id, { method: 'DELETE' });
+    if (r.status === 401 || r.status === 403) { onUnauthorized(); throw new Error('not allowed'); }
     if (!r.ok) throw new Error('delete failed');
   },
   downloadUrl(id) { return '/api/schematics/' + id + '/file'; },
+  // One call for both login and sign-up: the server decides based on whether
+  // the username already exists.
+  async enter(username, password) {
+    const r = await fetch('/api/auth', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || 'authentication failed');
+    return data;
+  },
+  async logout() {
+    await fetch('/api/auth/logout', { method: 'POST' });
+  },
+  async me() {
+    const r = await fetch('/api/auth/me');
+    if (!r.ok) return null;
+    return (await r.json()).user;
+  },
 };
+
+// ───────────────────────────────────────────────────────────────
+//  Auth state
+// ───────────────────────────────────────────────────────────────
+let currentUser = null;
+
+// Called when an authenticated request is rejected; resets local state.
+function onUnauthorized() {
+  if (!currentUser) return;
+  currentUser = null;
+  renderAuthNav();
+  toast('Please sign in to continue', 'error');
+}
+
+async function refreshAuth() {
+  try { currentUser = await API.me(); } catch { currentUser = null; }
+  renderAuthNav();
+  return currentUser;
+}
+
+// Whether the signed-in user may edit/delete a schematic.
+// Legacy uploads have no owner and are manageable by any signed-in user.
+function canManage(meta) {
+  return !!currentUser && (!meta.ownerId || meta.ownerId === currentUser.id);
+}
+
+function renderAuthNav() {
+  const el = document.getElementById('site-user');
+  if (!el) return;
+  if (currentUser) {
+    const initial = (currentUser.username || '?').charAt(0);
+    el.innerHTML = `
+      <div class="profile-menu" id="profile-menu">
+        <button class="profile-trigger" id="profile-trigger" type="button" aria-haspopup="true" aria-expanded="false">
+          <span class="avatar">${esc(initial)}</span>
+          <span class="profile-name">${esc(currentUser.username)}</span>
+          <svg class="profile-chevron" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+        <div class="profile-dropdown" id="profile-dropdown" hidden>
+          <div class="profile-dropdown-head">
+            <p class="profile-dropdown-label">Signed in as</p>
+            <p class="profile-dropdown-user">${esc(currentUser.username)}</p>
+          </div>
+          <div class="profile-dropdown-body">
+            <button class="profile-logout" id="logout-btn" type="button"><span>&#10132;</span> Logout</button>
+          </div>
+        </div>
+      </div>`;
+    const trigger = document.getElementById('profile-trigger');
+    const dropdown = document.getElementById('profile-dropdown');
+    trigger.addEventListener('click', () => {
+      const open = !dropdown.hidden;
+      dropdown.hidden = open;
+      trigger.classList.toggle('open', !open);
+      trigger.setAttribute('aria-expanded', String(!open));
+    });
+    document.getElementById('logout-btn').addEventListener('click', doLogout);
+  } else {
+    el.innerHTML = `
+      <a href="#/login" class="button button-primary button-sm">Sign in</a>`;
+  }
+}
+
+function closeProfileMenus(e) {
+  document.querySelectorAll('.profile-menu').forEach(root => {
+    if (e && e.target && root.contains(e.target)) return;
+    const dropdown = root.querySelector('.profile-dropdown');
+    const trigger = root.querySelector('.profile-trigger');
+    if (dropdown) dropdown.hidden = true;
+    if (trigger) {
+      trigger.classList.remove('open');
+      trigger.setAttribute('aria-expanded', 'false');
+    }
+  });
+}
+document.addEventListener('click', closeProfileMenus);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeProfileMenus(); });
+
+async function doLogout() {
+  try { await API.logout(); } catch {}
+  currentUser = null;
+  renderAuthNav();
+  toast('Signed out');
+  if (location.hash === '#/' || location.hash === '') route();
+  else location.hash = '#/';
+}
 
 // ───────────────────────────────────────────────────────────────
 //  Toast
@@ -409,9 +524,12 @@ function route() {
   // highlight nav
   document.querySelectorAll('.nav-link').forEach(a => a.classList.remove('active'));
   if (parts[0] === 'upload') document.querySelector('[data-nav="upload"]')?.classList.add('active');
-  else document.querySelector('[data-nav="schematics"]')?.classList.add('active');
+  else if (parts[0] === 'mine') document.querySelector('[data-nav="mine"]')?.classList.add('active');
+  else if (parts[0] !== 'login' && parts[0] !== 'register') document.querySelector('[data-nav="schematics"]')?.classList.add('active');
 
-  if (parts.length === 0 || (parts.length === 1 && parts[0] === '')) { renderList(); return; }
+  if (parts.length === 0 || (parts.length === 1 && parts[0] === '')) { renderList({ owner: '' }); return; }
+  if (parts[0] === 'login' || parts[0] === 'register') { renderAuth(); return; }
+  if (parts[0] === 'mine') { renderList({ owner: 'me', offset: 0 }); return; }
   if (parts[0] === 'upload') { renderUpload(); return; }
   if (parts[0] === 'schematic' && parts[1] && parts[2] === 'edit') { renderEdit(parts[1]); return; }
   if (parts[0] === 'schematic' && parts[1]) { renderDetail(parts[1]); return; }
@@ -422,15 +540,29 @@ window.addEventListener('hashchange', route);
 // ───────────────────────────────────────────────────────────────
 //  List / browse view
 // ───────────────────────────────────────────────────────────────
-let _listState = { q: '', sort: 'uploadDate', order: 'desc', limit: 20, offset: 0 };
+let _listState = { q: '', sort: 'uploadDate', order: 'desc', limit: 20, offset: 0, owner: '' };
 
 async function renderList(overrides = {}) {
   Object.assign(_listState, overrides);
   const s = _listState;
+  const mine = s.owner === 'me';
+
+  if (mine && !currentUser) {
+    $view.innerHTML = `
+      <div class="fade-in">
+        <h2 class="page-title">My Uploads</h2>
+        <div class="panel empty-state">
+          <div class="empty-icon">&#128274;</div>
+          <p class="empty-text">You need an account to see your uploads.</p>
+          <p class="empty-hint"><a href="#/login">Sign in</a> to continue.</p>
+        </div>
+      </div>`;
+    return;
+  }
 
   let html = `
     <div class="fade-in">
-      <h2 class="page-title">Schematics</h2>
+      <h2 class="page-title">${mine ? 'My Uploads' : 'Schematics'}</h2>
       <div class="toolbar">
         <input class="input" id="search-input" placeholder="Search schematics..." value="${esc(s.q)}" />
         <select class="select" id="sort-select">
@@ -459,7 +591,7 @@ async function renderList(overrides = {}) {
 
   // fetch
   try {
-    const data = await API.list({ q: s.q, sort: s.sort, order: s.order, limit: s.limit, offset: s.offset });
+    const data = await API.list({ q: s.q, sort: s.sort, order: s.order, limit: s.limit, offset: s.offset, owner: s.owner });
     renderListBody(data);
   } catch (err) {
     if (err.name === 'AbortError') return;
@@ -470,10 +602,11 @@ async function renderList(overrides = {}) {
 function renderListBody(data) {
   const el = document.getElementById('list-body');
   if (!data.items || data.items.length === 0) {
+    const mine = _listState.owner === 'me';
     el.innerHTML = `
       <div class="empty-state panel">
         <div class="empty-icon">&#128196;</div>
-        <p class="empty-text">${_listState.q ? 'No schematics match your search.' : 'No schematics uploaded yet.'}</p>
+        <p class="empty-text">${_listState.q ? 'No schematics match your search.' : (mine ? "You haven't uploaded any schematics yet." : 'No schematics uploaded yet.')}</p>
         ${!_listState.q ? '<p class="empty-hint"><a href="#/upload">Upload your first schematic</a></p>' : ''}
       </div>`;
     return;
@@ -492,6 +625,7 @@ function renderListBody(data) {
           <div class="card-desc">${esc(m.description || m.fileName)}</div>
           <div class="card-meta">
             <span class="card-size">${fmtBytes(m.size)}</span>
+            <span class="card-owner">${esc(m.ownerName || 'anonymous')}</span>
             <span>${fmtDate(m.uploadDate)}</span>
             <a href="${API.downloadUrl(m.id)}" class="button button-secondary button-sm card-download" download title="Download ${esc(m.fileName)}" onclick="event.stopPropagation()">Download</a>
           </div>
@@ -540,6 +674,19 @@ function renderListBody(data) {
 //  Upload / create view
 // ───────────────────────────────────────────────────────────────
 function renderUpload() {
+  if (!currentUser) {
+    $view.innerHTML = `
+      <div class="fade-in">
+        <h2 class="page-title">Upload Schematic</h2>
+        <div class="panel empty-state">
+          <div class="empty-icon">&#128274;</div>
+          <p class="empty-text">You need an account to upload schematics.</p>
+          <p class="empty-hint"><a href="#/login">Sign in</a> to continue.</p>
+        </div>
+      </div>`;
+    return;
+  }
+
   $view.innerHTML = `
     <div class="fade-in">
       <h2 class="page-title">Upload Schematic</h2>
@@ -641,6 +788,7 @@ async function renderDetail(id) {
 
   const editHash = '#/schematic/' + id + '/edit';
   const dlUrl    = API.downloadUrl(id);
+  const owner    = canManage(meta);
 
   $view.innerHTML = `
     <div class="fade-in">
@@ -649,8 +797,8 @@ async function renderDetail(id) {
         ${meta.description ? '<p class="detail-description">' + esc(meta.description) + '</p>' : ''}
         <div class="detail-actions">
           <a href="${dlUrl}" class="button button-primary" download>Download</a>
-          <a href="${editHash}" class="button button-secondary">Edit</a>
-          <button class="button button-danger" id="detail-delete">Delete</button>
+          ${owner ? `<a href="${editHash}" class="button button-secondary">Edit</a>
+          <button class="button button-danger" id="detail-delete">Delete</button>` : ''}
         </div>
       </div>
       <div class="panel viewer-panel">
@@ -662,6 +810,7 @@ async function renderDetail(id) {
       <div class="panel">
         <div class="meta-grid">
           <div class="meta-item"><span class="meta-label">ID</span><span class="meta-value">${esc(meta.id)}</span></div>
+          <div class="meta-item"><span class="meta-label">Uploader</span><span class="meta-value">${esc(meta.ownerName || 'anonymous')}</span></div>
           <div class="meta-item"><span class="meta-label">Original File</span><span class="meta-value">${esc(meta.fileName)}</span></div>
           <div class="meta-item"><span class="meta-label">File Size</span><span class="meta-value">${fmtBytes(meta.size)}</span></div>
           <div class="meta-item"><span class="meta-label">Content Type</span><span class="meta-value">${esc(meta.contentType)}</span></div>
@@ -671,7 +820,7 @@ async function renderDetail(id) {
       </div>
     </div>`;
 
-  document.getElementById('detail-delete').addEventListener('click', async () => {
+  document.getElementById('detail-delete')?.addEventListener('click', async () => {
     const ok = await confirm('Delete Schematic', `Are you sure you want to delete "${meta.name}"? This cannot be undone.`);
     if (!ok) return;
     try {
@@ -690,11 +839,28 @@ async function renderDetail(id) {
 //  Edit view
 // ───────────────────────────────────────────────────────────────
 async function renderEdit(id) {
+  if (!currentUser) {
+    $view.innerHTML = `
+      <div class="fade-in">
+        <h2 class="page-title">Edit Schematic</h2>
+        <div class="panel empty-state">
+          <div class="empty-icon">&#128274;</div>
+          <p class="empty-text">You need an account to edit schematics.</p>
+          <p class="empty-hint"><a href="#/login">Sign in</a> to continue.</p>
+        </div>
+      </div>`;
+    return;
+  }
+
   $view.innerHTML = '<div class="panel fade-in"><div class="empty-state"><p class="empty-text">Loading...</p></div></div>';
 
   let meta;
   try { meta = await API.get(id); } catch {
     $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Schematic not found</h2><a href="#/" class="button button-secondary">Back to list</a></div>';
+    return;
+  }
+  if (!canManage(meta)) {
+    $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Not allowed</h2><p class="empty-text">You do not own this schematic.</p><a href="#/schematic/' + id + '" class="button button-secondary">Back</a></div>';
     return;
   }
 
@@ -740,6 +906,63 @@ async function renderEdit(id) {
 }
 
 // ───────────────────────────────────────────────────────────────
+//  Sign in / sign up (single form)
+// ───────────────────────────────────────────────────────────────
+function renderAuth() {
+  if (currentUser) { location.hash = '#/'; return; }
+  $view.innerHTML = `
+    <div class="fade-in auth-view">
+      <div class="panel">
+        <h2 class="page-title">Sign In</h2>
+        <p class="auth-desc">New here? Pick a username and password &mdash; your account is created automatically.</p>
+        <form id="auth-form" autocomplete="on">
+          <div class="form-group">
+            <label class="label" for="auth-username">Username</label>
+            <input class="input" id="auth-username" name="username" autocomplete="username" minlength="3" maxlength="32" required />
+            <div class="form-hint">3-32 characters: letters, digits, underscore or hyphen.</div>
+          </div>
+          <div class="form-group">
+            <label class="label" for="auth-password">Password</label>
+            <input class="input" id="auth-password" name="password" type="password" autocomplete="current-password" minlength="8" maxlength="72" required />
+            <div class="form-hint">At least 8 characters.</div>
+          </div>
+          <div class="auth-error" id="auth-error" hidden></div>
+          <div class="auth-actions">
+            <button type="submit" class="button button-primary" id="auth-btn">Continue</button>
+          </div>
+        </form>
+      </div>
+    </div>`;
+
+  document.getElementById('auth-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const btn = document.getElementById('auth-btn');
+    const errEl = document.getElementById('auth-error');
+    errEl.hidden = true;
+    btn.disabled = true;
+    btn.textContent = 'Please wait...';
+    try {
+      const { user, created } = await API.enter(
+        document.getElementById('auth-username').value.trim(),
+        document.getElementById('auth-password').value,
+      );
+      currentUser = user;
+      renderAuthNav();
+      toast(created ? 'Account created' : 'Welcome back, ' + user.username);
+      location.hash = '#/';
+    } catch (err) {
+      errEl.textContent = err.message || 'Authentication failed';
+      errEl.hidden = false;
+      btn.disabled = false;
+      btn.textContent = 'Continue';
+    }
+  });
+}
+
+// ───────────────────────────────────────────────────────────────
 //  Boot
 // ───────────────────────────────────────────────────────────────
-route();
+(async function boot() {
+  await refreshAuth();
+  route();
+})();
