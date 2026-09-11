@@ -28,6 +28,13 @@ type SchematicMetadata struct {
 	OwnerName   string    `json:"ownerName,omitempty"` // joined from users
 	UploadDate  time.Time `json:"uploadDate"`
 	UpdatedDate time.Time `json:"updatedDate"`
+	// Aggregate feedback. UserRating/Liked are filled for the viewer when a
+	// viewer ID is supplied (0 / false otherwise).
+	AvgRating   float64 `json:"avgRating"`
+	RatingCount int     `json:"ratingCount"`
+	LikeCount   int     `json:"likeCount"`
+	UserRating  int     `json:"userRating"`
+	Liked       bool    `json:"liked"`
 }
 
 // ListFilter selects which IDs/metadata to return for GET /api/schematics.
@@ -42,6 +49,7 @@ type ListFilter struct {
 	Order       string     // "asc" | "desc" (default)
 	Limit       int        // <=0 means no limit (capped by MaxListLimit)
 	Offset      int        // >=0
+	ViewerID    string     // fills per-viewer UserRating/Liked when set
 }
 
 const MaxListLimit = 200
@@ -74,6 +82,22 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+CREATE TABLE IF NOT EXISTS ratings (
+	schematic_id TEXT NOT NULL,
+	user_id      TEXT NOT NULL,
+	rating       INTEGER NOT NULL,
+	created_at   TEXT NOT NULL,
+	updated_at   TEXT NOT NULL,
+	PRIMARY KEY (schematic_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ratings_schematic ON ratings(schematic_id);
+CREATE TABLE IF NOT EXISTS likes (
+	schematic_id TEXT NOT NULL,
+	user_id      TEXT NOT NULL,
+	created_at   TEXT NOT NULL,
+	PRIMARY KEY (schematic_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_likes_schematic ON likes(schematic_id);
 `
 
 // Store persists schematic blobs on disk and their metadata in SQLite:
@@ -222,10 +246,12 @@ func scanMetadata(row interface {
 	var m SchematicMetadata
 	var uploadDate, updatedDate string
 	var ownerID, ownerName sql.NullString
+	var liked int
 	if err := row.Scan(
 		&m.ID, &m.Name, &m.Description, &m.FileName,
 		&m.Size, &m.ContentType, &uploadDate, &updatedDate,
 		&ownerID, &ownerName,
+		&m.AvgRating, &m.RatingCount, &m.LikeCount, &m.UserRating, &liked,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return SchematicMetadata{}, ErrNotFound
@@ -234,6 +260,7 @@ func scanMetadata(row interface {
 	}
 	m.OwnerID = ownerID.String
 	m.OwnerName = ownerName.String
+	m.Liked = liked != 0
 	var err error
 	if m.UploadDate, err = parseTime(uploadDate); err != nil {
 		return SchematicMetadata{}, err
@@ -244,7 +271,17 @@ func scanMetadata(row interface {
 	return m, nil
 }
 
-const metaColumns = "s.id, s.name, s.description, s.file_name, s.size, s.content_type, s.upload_date, s.updated_date, s.owner_id, u.username"
+// metaColumns returns the shared SELECT list. viewerID is bound twice (once
+// for the viewer's rating, once for their like) and must be passed first in
+// the query args, before any WHERE args, because the subqueries precede WHERE.
+func metaColumns(viewerID string) string {
+	return "s.id, s.name, s.description, s.file_name, s.size, s.content_type, s.upload_date, s.updated_date, s.owner_id, u.username, " +
+		`COALESCE((SELECT AVG(r.rating) FROM ratings r WHERE r.schematic_id = s.id), 0), ` +
+		`COALESCE((SELECT COUNT(*) FROM ratings r WHERE r.schematic_id = s.id), 0), ` +
+		`COALESCE((SELECT COUNT(*) FROM likes l WHERE l.schematic_id = s.id), 0), ` +
+		`COALESCE((SELECT r.rating FROM ratings r WHERE r.schematic_id = s.id AND r.user_id = ?), 0), ` +
+		`COALESCE((SELECT 1 FROM likes l WHERE l.schematic_id = s.id AND l.user_id = ?), 0)`
+}
 
 const metaFrom = "FROM schematics s LEFT JOIN users u ON u.id = s.owner_id"
 
@@ -281,13 +318,18 @@ func (s *Store) Create(ownerID, name, description, fileName string, data []byte)
 	return meta, nil
 }
 
-// Get returns metadata for one ID.
+// Get returns metadata for one ID without viewer-specific feedback fields.
 func (s *Store) Get(id string) (SchematicMetadata, error) {
+	return s.GetViewer(id, "")
+}
+
+// GetViewer is Get plus the viewer's own rating and like state.
+func (s *Store) GetViewer(id, viewerID string) (SchematicMetadata, error) {
 	if !validID(id) {
 		return SchematicMetadata{}, ErrNotFound
 	}
 	meta, err := scanMetadata(s.db.QueryRow(
-		`SELECT `+metaColumns+` `+metaFrom+` WHERE s.id = ?`, id,
+		`SELECT `+metaColumns(viewerID)+` `+metaFrom+` WHERE s.id = ?`, viewerID, viewerID, id,
 	))
 	if err != nil {
 		return SchematicMetadata{}, err
@@ -437,10 +479,11 @@ func (s *Store) List(f ListFilter) ([]SchematicMetadata, int, error) {
 		order = "ASC"
 	}
 	// Tie-break on ID for stable pagination.
-	query := `SELECT ` + metaColumns + ` ` + metaFrom + ` ` + where +
+	query := `SELECT ` + metaColumns(f.ViewerID) + ` ` + metaFrom + ` ` + where +
 		` ORDER BY ` + orderBy + ` ` + order + `, s.id ASC`
 
-	queryArgs := append([]any{}, args...)
+	// metaColumns binds viewerID twice before the WHERE args.
+	queryArgs := append([]any{f.ViewerID, f.ViewerID}, args...)
 	if f.Limit > 0 {
 		limit := f.Limit
 		if limit > MaxListLimit {
@@ -468,22 +511,8 @@ func (s *Store) List(f ListFilter) ([]SchematicMetadata, int, error) {
 	defer rows.Close()
 	items := []SchematicMetadata{}
 	for rows.Next() {
-		var m SchematicMetadata
-		var uploadDate, updatedDate string
-		var ownerID, ownerName sql.NullString
-		if err := rows.Scan(
-			&m.ID, &m.Name, &m.Description, &m.FileName,
-			&m.Size, &m.ContentType, &uploadDate, &updatedDate,
-			&ownerID, &ownerName,
-		); err != nil {
-			return nil, 0, err
-		}
-		m.OwnerID = ownerID.String
-		m.OwnerName = ownerName.String
-		if m.UploadDate, err = parseTime(uploadDate); err != nil {
-			return nil, 0, err
-		}
-		if m.UpdatedDate, err = parseTime(updatedDate); err != nil {
+		m, err := scanMetadata(rows)
+		if err != nil {
 			return nil, 0, err
 		}
 		items = append(items, m)
@@ -492,4 +521,46 @@ func (s *Store) List(f ListFilter) ([]SchematicMetadata, int, error) {
 		return nil, 0, err
 	}
 	return items, total, nil
+}
+
+// SetRating inserts or updates a user's 1-5 rating for a schematic.
+func (s *Store) SetRating(schematicID, userID string, rating int) error {
+	if rating < 1 || rating > 5 {
+		return errors.New("rating must be between 1 and 5")
+	}
+	now := formatTime(time.Now().UTC())
+	_, err := s.db.Exec(`
+		INSERT INTO ratings (schematic_id, user_id, rating, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(schematic_id, user_id)
+		DO UPDATE SET rating = excluded.rating, updated_at = excluded.updated_at`,
+		schematicID, userID, rating, now, now)
+	return err
+}
+
+// ClearRating removes a user's rating for a schematic.
+func (s *Store) ClearRating(schematicID, userID string) error {
+	_, err := s.db.Exec(`DELETE FROM ratings WHERE schematic_id = ? AND user_id = ?`, schematicID, userID)
+	return err
+}
+
+// ToggleLike flips a user's like on a schematic and reports the new state.
+func (s *Store) ToggleLike(schematicID, userID string) (bool, error) {
+	var one int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM likes WHERE schematic_id = ? AND user_id = ?`, schematicID, userID,
+	).Scan(&one)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		_, err = s.db.Exec(
+			`INSERT INTO likes (schematic_id, user_id, created_at) VALUES (?, ?, ?)`,
+			schematicID, userID, formatTime(time.Now().UTC()),
+		)
+		return true, err
+	case err != nil:
+		return false, err
+	default:
+		_, err = s.db.Exec(`DELETE FROM likes WHERE schematic_id = ? AND user_id = ?`, schematicID, userID)
+		return false, err
+	}
 }

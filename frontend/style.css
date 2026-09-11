@@ -477,6 +477,130 @@ a:hover { color: #93c5fd; }
 .card-owner { color: #7c8ba1; }
 .card-date { white-space: nowrap; }
 .card-download { margin-left: auto; text-decoration: none; }
+
+/* ── Stars & likes ─────────────────────────────────────────── */
+.star-icon, .heart-icon {
+  width: 1em;
+  height: 1em;
+  display: inline-block;
+  vertical-align: -0.12em;
+  flex: 0 0 auto;
+}
+.card-rating {
+  display: flex;
+  align-items: center;
+  gap: .3rem;
+  font-size: .5rem;
+  color: #facc15;
+}
+.card-rating .star-icon { stroke: currentColor; }
+.card-rating .rating-count { color: #64748b; }
+.card-rating .rating-empty { color: #475569; display: inline-flex; align-items: center; gap: .3rem; }
+.card-rating .rating-empty .star-icon { stroke: #475569; }
+
+.like-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  aspect-ratio: 1 / 1;
+  padding: .45rem;
+  border-radius: .45rem;
+  background: rgba(239,68,68,.1);
+  border: 1px solid rgba(239,68,68,.35);
+  color: #ef4444;
+  font-family: inherit;
+  font-size: .55rem;
+  line-height: 1.5;
+  cursor: pointer;
+  transition: color .15s, background .15s, border-color .15s;
+}
+.like-btn:hover:not(:disabled) { color: #f87171; background: rgba(239,68,68,.18); border-color: rgba(248,113,113,.55); }
+.like-btn:disabled { opacity: .5; cursor: default; }
+.like-btn .heart-icon { width: 1.5em; height: 1.5em; fill: currentColor; }
+.like-btn.liked { color: #fca5a5; border-color: rgba(248,113,113,.7); background: rgba(239,68,68,.28); }
+.like-btn .like-count {
+  position: absolute;
+  top: -.3rem;
+  right: -.3rem;
+  min-width: .85rem;
+  padding: 0 .18rem;
+  font-size: .42rem;
+  line-height: .85rem;
+  text-align: center;
+  border-radius: 9999px;
+  background: rgba(15,23,42,.95);
+  color: #cbd5e1;
+  border: 1px solid rgba(148,163,184,.4);
+}
+
+/* Hearts bubbling out of a like button (and back when unliked). */
+.heart-burst {
+  position: fixed;
+  z-index: 100;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  transform: translate(-50%, -50%);
+}
+.heart-bubble {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1rem;
+  height: 1rem;
+  color: #ef4444;
+  opacity: 0;
+  animation: heartRise 950ms ease-out forwards;
+  animation-delay: var(--delay, 0ms);
+}
+.heart-bubble .heart-icon { width: 100%; height: 100%; fill: currentColor; }
+.heart-bubble.down { color: #64748b; animation-name: heartFall; }
+@keyframes heartRise {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(.3); }
+  18% { opacity: 1; }
+  100% { opacity: 0; transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, -60px))) scale(1.15) rotate(var(--rot, 0deg)); }
+}
+@keyframes heartFall {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(1.15); }
+  18% { opacity: .9; }
+  100% { opacity: 0; transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, 60px))) scale(.3) rotate(var(--rot, 0deg)); }
+}
+.rail-btn.like-rail { flex-direction: column; gap: .15rem; color: #ef4444; }
+.rail-btn.like-rail .like-count { font-size: .45rem; line-height: 1; color: #94a3b8; }
+.rail-btn.like-rail.liked { color: #fca5a5; border-color: rgba(248,113,113,.7); background: rgba(239,68,68,.28); }
+.rail-btn.like-rail.liked .heart-icon { fill: currentColor; }
+
+.rating-widget {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem;
+  margin: .75rem 0 1rem;
+  padding: .6rem .75rem;
+  border-radius: .55rem;
+  background: rgba(255,255,255,.03);
+  border: 1px solid rgba(255,255,255,.07);
+}
+.rating-widget .stars { display: inline-flex; gap: .15rem; }
+.rating-widget .star,
+.rating-widget .star-btn {
+  display: inline-flex;
+  padding: 0;
+  background: none;
+  border: none;
+  color: #475569;
+  font-size: .85rem;
+  line-height: 1;
+}
+.rating-widget .star-btn { cursor: pointer; transition: color .12s, transform .12s; }
+.rating-widget .star-btn:hover:not(:disabled) { color: #fde047; transform: scale(1.12); }
+.rating-widget .star-btn:disabled { cursor: default; }
+.rating-widget .star.filled,
+.rating-widget .star-btn.filled { color: #facc15; }
+.rating-widget .star.filled .star-icon,
+.rating-widget .star-btn.filled .star-icon { fill: currentColor; }
+.rating-summary { font-size: .5rem; color: #94a3b8; }
 .schematic-card:focus-visible {
   outline: 2px solid rgba(96,165,250,.5);
   outline-offset: 2px;

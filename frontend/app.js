@@ -51,6 +51,20 @@ const API = {
     if (r.status === 401 || r.status === 403) { onUnauthorized(); throw new Error('not allowed'); }
     if (!r.ok) throw new Error('delete failed');
   },
+  // Set (or clear) the signed-in user's 1-5 star rating.
+  async rate(id, rating) {
+    return feedbackRequest('/api/schematics/' + id + '/rating', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rating }),
+    });
+  },
+  async unrate(id) {
+    return feedbackRequest('/api/schematics/' + id + '/rating', { method: 'DELETE' });
+  },
+  async toggleLike(id) {
+    return feedbackRequest('/api/schematics/' + id + '/like', { method: 'POST' });
+  },
   downloadUrl(id) { return '/api/schematics/' + id + '/file'; },
   // One call for both login and sign-up: the server decides based on whether
   // the username already exists.
@@ -73,6 +87,18 @@ const API = {
     return (await r.json()).user;
   },
 };
+
+// Shared fetch for rating/like actions: maps auth failures to sign-in prompts.
+async function feedbackRequest(url, options) {
+  const r = await fetch(url, options);
+  if (r.status === 401 || r.status === 403) { onUnauthorized(); throw new Error('not allowed'); }
+  if (!r.ok) {
+    let msg = 'request failed';
+    try { msg = (await r.json()).error || msg; } catch {}
+    throw new Error(msg);
+  }
+  return r.json();
+}
 
 // ───────────────────────────────────────────────────────────────
 //  Auth state
@@ -837,6 +863,7 @@ function cardHtml(m) {
         <div class="card-title-wrap">
           <div class="card-name">${esc(m.name)}</div>
           <div class="card-desc">${esc(m.description || m.fileName)}</div>
+          <div class="card-rating">${cardRatingHtml(m)}</div>
         </div>
       </div>
       <div class="card-meta">
@@ -844,15 +871,105 @@ function cardHtml(m) {
         <span class="card-owner">${esc(m.ownerName || 'anonymous')}</span>
         <span class="card-date">${fmtDate(m.uploadDate)}</span>
         <a href="${API.downloadUrl(m.id)}" class="button button-secondary button-sm card-download" download title="Download ${esc(m.fileName)}" onclick="event.stopPropagation()">Download</a>
+        <button type="button" class="like-btn ${m.liked ? 'liked' : ''}" data-like title="Like" aria-label="Like" aria-pressed="${m.liked}">
+          ${heartSvg()}<span class="like-count">${m.likeCount || 0}</span>
+        </button>
       </div>
     </div>`;
+}
+
+function heartSvg() {
+  return '<svg class="heart-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 21s-7.5-4.7-9.7-9.1A5.4 5.4 0 0 1 12 5.4a5.4 5.4 0 0 1 9.7 6.5C19.5 16.3 12 21 12 21z"/></svg>';
+}
+
+function starSvg() {
+  return '<svg class="star-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.2l2.8 5.7 6.2.9-4.5 4.4 1.1 6.2-5.6-2.9-5.6 2.9 1.1-6.2L3 9.8l6.2-.9z"/></svg>';
+}
+
+function cardRatingHtml(m) {
+  if (!m.ratingCount) return '<span class="rating-empty">' + starSvg() + '<span>no ratings</span></span>';
+  return starSvg() + '<span>' + m.avgRating.toFixed(1) + '</span><span class="rating-count">(' + m.ratingCount + ')</span>';
+}
+
+// Renders 1-5 stars. Interactive buttons carry data-star for click handling.
+function ratingStarsHtml(m, interactive) {
+  const fill = m.userRating || Math.round(m.avgRating || 0);
+  return [1, 2, 3, 4, 5].map(i => {
+    const filled = i <= fill ? 'filled' : '';
+    if (!interactive) return '<span class="star ' + filled + '">' + starSvg() + '</span>';
+    const selected = m.userRating === i ? 'selected' : '';
+    return '<button type="button" class="star-btn ' + filled + ' ' + selected + '" data-star="' + i +
+      '" title="' + i + ' star' + (i > 1 ? 's' : '') + '" aria-label="Rate ' + i + ' star' + (i > 1 ? 's' : '') + '">' +
+      starSvg() + '</button>';
+  }).join('');
+}
+
+function ratingSummaryText(m) {
+  let text = !m.ratingCount ? 'No ratings yet'
+    : m.avgRating.toFixed(1) + ' / 5 \u00b7 ' + m.ratingCount + ' rating' + (m.ratingCount === 1 ? '' : 's');
+  if (m.userRating) text += ' \u00b7 your rating: ' + m.userRating;
+  return text;
+}
+
+// Applies a fresh metadata object to a like button (card or detail rail).
+function applyLikeState(btn, meta) {
+  btn.classList.toggle('liked', !!meta.liked);
+  btn.setAttribute('aria-pressed', String(!!meta.liked));
+  const count = btn.querySelector('.like-count');
+  if (count) count.textContent = meta.likeCount || 0;
+}
+
+// Bursts hearts upward from a button when liked; the same animation runs in
+// reverse (hearts drift down and shrink) when a like is removed.
+function spawnHearts(btn, liked) {
+  if (!btn || !btn.isConnected) return;
+  const rect = btn.getBoundingClientRect();
+  const layer = document.createElement('div');
+  layer.className = 'heart-burst';
+  layer.style.left = (rect.left + rect.width / 2) + 'px';
+  layer.style.top = (rect.top + rect.height / 2) + 'px';
+  for (let i = 0; i < 7; i++) {
+    const h = document.createElement('span');
+    h.className = 'heart-bubble' + (liked ? '' : ' down');
+    const dx = (Math.random() * 2 - 1) * 34;
+    const dy = Math.random() * 46 + 38;
+    h.style.setProperty('--dx', dx.toFixed(1) + 'px');
+    h.style.setProperty('--dy', (liked ? -dy : dy).toFixed(1) + 'px');
+    h.style.setProperty('--rot', ((Math.random() * 2 - 1) * 40).toFixed(0) + 'deg');
+    h.style.setProperty('--delay', (i * 45) + 'ms');
+    h.innerHTML = heartSvg();
+    layer.appendChild(h);
+  }
+  document.body.appendChild(layer);
+  setTimeout(() => layer.remove(), 1400);
+}
+
+async function onLikeClick(btn, id) {
+  if (btn.disabled) return;
+  if (!currentUser) { toast('Sign in to like schematics', 'error'); location.hash = '#/login'; return; }
+  btn.disabled = true;
+  try {
+    const meta = await API.toggleLike(id);
+    applyLikeState(btn, meta);
+    spawnHearts(btn, meta.liked);
+    const item = _listItems.find(x => x.id === id);
+    if (item) { item.liked = meta.liked; item.likeCount = meta.likeCount; }
+  } catch (err) {
+    toast(err.message || 'Failed to update like', 'error');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function mountListCards(cards) {
   for (const card of cards) {
     const go = () => { location.hash = card.dataset.href; };
     card.addEventListener('click', go);
-    card.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); go(); } });
+    card.addEventListener('keydown', e => { if (e.target === card && e.key === 'Enter') { e.preventDefault(); go(); } });
+    card.querySelector('[data-like]')?.addEventListener('click', e => {
+      e.stopPropagation();
+      onLikeClick(e.currentTarget, card.dataset.id);
+    });
   }
   if (previewsSupported()) {
     const obs = thumbObserver();
@@ -1051,6 +1168,10 @@ async function renderDetail(id) {
       <div class="panel detail-info">
         <h2 class="page-title detail-name">${esc(meta.name)}</h2>
         ${meta.description ? '<p class="detail-description">' + esc(meta.description) + '</p>' : ''}
+        <div class="rating-widget" id="detail-rating">
+          <div class="stars" role="group" aria-label="Rate this schematic">${ratingStarsHtml(meta, true)}</div>
+          <span class="rating-summary">${ratingSummaryText(meta)}</span>
+        </div>
         <div class="meta-grid">
           <div class="meta-item"><span class="meta-label">Uploader</span><span class="meta-value">${esc(meta.ownerName || 'anonymous')}</span></div>
           <div class="meta-item"><span class="meta-label">File Size</span><span class="meta-value">${fmtBytes(meta.size)}</span></div>
@@ -1071,6 +1192,9 @@ async function renderDetail(id) {
           <a href="${dlUrl}" class="rail-btn" download title="Download" aria-label="Download">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>
           </a>
+          <button type="button" class="rail-btn like-rail ${meta.liked ? 'liked' : ''}" id="detail-like" data-like title="Like" aria-label="Like" aria-pressed="${meta.liked}">
+            ${heartSvg()}<span class="like-count">${meta.likeCount || 0}</span>
+          </button>
           ${owner ? `<button type="button" class="rail-btn" id="detail-edit" title="Edit" aria-label="Edit">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
           </button>
@@ -1103,6 +1227,48 @@ async function renderDetail(id) {
       toast('Schematic deleted');
       location.hash = '#/';
     } catch { toast('Failed to delete', 'error'); }
+  });
+
+  // Star rating (clicking your current rating clears it).
+  const ratingEl = document.getElementById('detail-rating');
+  if (ratingEl) {
+    const onStar = async e => {
+      const btn = e.currentTarget;
+      if (!currentUser) { toast('Sign in to rate schematics', 'error'); location.hash = '#/login'; return; }
+      if (btn.disabled) return;
+      btn.disabled = true;
+      const value = Number(btn.dataset.star);
+      try {
+        const updated = (meta.userRating === value) ? await API.unrate(id) : await API.rate(id, value);
+        Object.assign(meta, updated);
+        ratingEl.querySelector('.stars').innerHTML = ratingStarsHtml(meta, true);
+        ratingEl.querySelector('.rating-summary').textContent = ratingSummaryText(meta);
+        ratingEl.querySelectorAll('.star-btn').forEach(b => b.addEventListener('click', onStar));
+      } catch (err) {
+        toast(err.message || 'Failed to save rating', 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    };
+    ratingEl.querySelectorAll('.star-btn').forEach(b => b.addEventListener('click', onStar));
+  }
+
+  // Like toggle in the action rail.
+  document.getElementById('detail-like')?.addEventListener('click', async e => {
+    const btn = e.currentTarget;
+    if (!currentUser) { toast('Sign in to like schematics', 'error'); location.hash = '#/login'; return; }
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try {
+      const updated = await API.toggleLike(id);
+      Object.assign(meta, updated);
+      applyLikeState(btn, meta);
+      spawnHearts(btn, meta.liked);
+    } catch (err) {
+      toast(err.message || 'Failed to update like', 'error');
+    } finally {
+      btn.disabled = false;
+    }
   });
 
   // Mount the interactive 3D viewer (cleaned up on route change).

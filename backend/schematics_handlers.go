@@ -83,6 +83,18 @@ func registerSchematicRoutes(mux *http.ServeMux, store *Store) {
 				return
 			}
 			handleSchematicFile(w, r, store, id)
+		case "rating":
+			user, ok := requireUser(w, r, store)
+			if !ok {
+				return
+			}
+			handleSchematicRating(w, r, store, id, user)
+		case "like":
+			user, ok := requireUser(w, r, store)
+			if !ok {
+				return
+			}
+			handleSchematicLike(w, r, store, id, user)
 		default:
 			writeErr(w, http.StatusNotFound, "not found")
 		}
@@ -217,6 +229,10 @@ func handleSchematicList(w http.ResponseWriter, r *http.Request, store *Store) {
 		}
 		f.OwnerID = user.ID
 	}
+	// Fill the viewer's own rating/like state when signed in (optional).
+	if user, ok := currentUser(r, store); ok {
+		f.ViewerID = user.ID
+	}
 	if f.Sort == "" {
 		f.Sort = "uploadDate"
 	}
@@ -275,9 +291,79 @@ func handleSchematicList(w http.ResponseWriter, r *http.Request, store *Store) {
 	})
 }
 
-// GET /api/schematics/{id} — metadata by ID.
-func handleSchematicGet(w http.ResponseWriter, _ *http.Request, store *Store, id string) {
-	meta, err := store.Get(id)
+// GET /api/schematics/{id} — metadata by ID, including the viewer's rating/like.
+func handleSchematicGet(w http.ResponseWriter, r *http.Request, store *Store, id string) {
+	viewerID := ""
+	if user, ok := currentUser(r, store); ok {
+		viewerID = user.ID
+	}
+	meta, err := store.GetViewer(id, viewerID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "schematic not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, meta)
+}
+
+// PUT/POST /api/schematics/{id}/rating — set the viewer's 1-5 rating.
+// DELETE /api/schematics/{id}/rating — remove it. Returns updated metadata.
+func handleSchematicRating(w http.ResponseWriter, r *http.Request, store *Store, id string, user User) {
+	if _, err := store.Get(id); err != nil {
+		writeErr(w, http.StatusNotFound, "schematic not found")
+		return
+	}
+	switch r.Method {
+	case http.MethodPut, http.MethodPost:
+		var body struct {
+			Rating int `json:"rating"`
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON body")
+			return
+		}
+		if body.Rating < 1 || body.Rating > 5 {
+			writeErr(w, http.StatusBadRequest, "rating must be between 1 and 5")
+			return
+		}
+		if err := store.SetRating(id, user.ID, body.Rating); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to save rating")
+			return
+		}
+	case http.MethodDelete:
+		if err := store.ClearRating(id, user.ID); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to clear rating")
+			return
+		}
+	default:
+		w.Header().Set("Allow", "PUT, POST, DELETE")
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	meta, err := store.GetViewer(id, user.ID)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "schematic not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, meta)
+}
+
+// POST /api/schematics/{id}/like — toggle the viewer's like. Returns metadata.
+func handleSchematicLike(w http.ResponseWriter, r *http.Request, store *Store, id string, user User) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if _, err := store.Get(id); err != nil {
+		writeErr(w, http.StatusNotFound, "schematic not found")
+		return
+	}
+	if _, err := store.ToggleLike(id, user.ID); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to update like")
+		return
+	}
+	meta, err := store.GetViewer(id, user.ID)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "schematic not found")
 		return
