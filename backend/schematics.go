@@ -45,7 +45,7 @@ type ListFilter struct {
 	OwnerID     string     // exact owner match (used for "my schematics")
 	From        *time.Time // uploadDate >= From
 	To          *time.Time // uploadDate <= To
-	Sort        string     // "uploadDate" (default) | "updatedDate" | "name" | "size"
+	Sort        string     // "uploadDate" (default) | "updatedDate" | "name" | "size" | "rating" | "likes"
 	Order       string     // "asc" | "desc" (default)
 	Limit       int        // <=0 means no limit (capped by MaxListLimit)
 	Offset      int        // >=0
@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS users (
 	id            TEXT PRIMARY KEY,
 	username      TEXT NOT NULL COLLATE NOCASE UNIQUE,
 	password_hash TEXT NOT NULL,
+	bio           TEXT NOT NULL DEFAULT '',
 	created_at    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -149,6 +150,11 @@ func NewStore(dataDir string) (*Store, error) {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_schematics_owner ON schematics(owner_id)`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("index schematics.owner_id: %w", err)
+	}
+	// Migration: databases created before profiles existed lack users.bio.
+	if err := s.ensureColumn("users", "bio", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate users.bio: %w", err)
 	}
 	return s, nil
 }
@@ -471,6 +477,10 @@ func (s *Store) List(f ListFilter) ([]SchematicMetadata, int, error) {
 		orderBy = "s.size"
 	case "updatedDate":
 		orderBy = "s.updated_date"
+	case "rating":
+		orderBy = `COALESCE((SELECT AVG(r.rating) FROM ratings r WHERE r.schematic_id = s.id), 0)`
+	case "likes":
+		orderBy = `COALESCE((SELECT COUNT(*) FROM likes l WHERE l.schematic_id = s.id), 0)`
 	default: // "uploadDate"
 		orderBy = "s.upload_date"
 	}

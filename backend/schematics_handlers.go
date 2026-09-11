@@ -237,9 +237,9 @@ func handleSchematicList(w http.ResponseWriter, r *http.Request, store *Store) {
 		f.Sort = "uploadDate"
 	}
 	switch f.Sort {
-	case "uploadDate", "updatedDate", "name", "size":
+	case "uploadDate", "updatedDate", "name", "size", "rating", "likes":
 	default:
-		writeErr(w, http.StatusBadRequest, "invalid sort (want uploadDate|updatedDate|name|size)")
+		writeErr(w, http.StatusBadRequest, "invalid sort (want uploadDate|updatedDate|name|size|rating|likes)")
 		return
 	}
 	if f.Order == "" {

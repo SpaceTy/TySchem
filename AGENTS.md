@@ -30,8 +30,9 @@ There is no lint/format config; use standard `gofmt` / `go vet`.
 
 ## API
 
-- Auth is one endpoint: `POST /api/auth` logs in when the username exists, otherwise registers (200 vs 201). Session token in an HttpOnly cookie; only its SHA-256 hash is stored.
-- Schematics: `GET/POST /api/schematics`, `GET/PUT/PATCH/DELETE /api/schematics/{id}`, `GET /api/schematics/{id}/file` (alias `/download`). List filters: `q,name,description,owner=me,sort,order,from,to,limit,offset,page,pageSize` (page/pageSize are 1-based aliases; response includes `total,totalPages`). The frontend infinite-scrolls filtered pages instead of paginating client-side.
+- Auth is one endpoint: `POST /api/auth` logs in when the username exists, otherwise registers (200 vs 201). Session token in an HttpOnly cookie; only its SHA-256 hash is stored. `GET /api/auth/me` returns the session user; `PUT/PATCH /api/auth/me` edits the signed-in account (`username`, `bio`, and optional `currentPassword`+`newPassword`).
+- Profiles: `GET /api/users/{username}` returns the public account plus `stats` (uploads, likes, avgRating, ratings) and the owner's `best` (by rating) and `latest` schematics.
+- Schematics: `GET/POST /api/schematics`, `GET/PUT/PATCH/DELETE /api/schematics/{id}`, `GET /api/schematics/{id}/file` (alias `/download`). List filters: `q,name,description,owner=me,sort,order,from,to,limit,offset,page,pageSize` (page/pageSize are 1-based aliases; response includes `total,totalPages`). `sort` accepts `uploadDate|updatedDate|name|size|rating|likes`. The frontend infinite-scrolls filtered pages instead of paginating client-side.
 - Uploads are multipart, max 50 MiB, and must start with the gzip magic bytes `1f 8b`.
 
 ## Conventions

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net"
@@ -141,18 +142,95 @@ func registerAuthRoutes(mux *http.ServeMux, store *Store) {
 	})
 
 	mux.HandleFunc("/api/auth/me", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			u, ok := currentUser(r, store)
+			if !ok {
+				writeErr(w, http.StatusUnauthorized, "not signed in")
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"user": u})
+		case http.MethodPut, http.MethodPatch:
+			handleUpdateMe(w, r, store)
+		default:
+			w.Header().Set("Allow", "GET, PUT, PATCH")
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+	})
+}
+
+// registerUserRoutes mounts the public profile API at /api/users/{username}.
+func registerUserRoutes(mux *http.ServeMux, store *Store) {
+	mux.HandleFunc("/api/users/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.Header().Set("Allow", "GET")
 			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
-		u, ok := currentUser(r, store)
-		if !ok {
-			writeErr(w, http.StatusUnauthorized, "not signed in")
+		username := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/users/"), "/")
+		if username == "" {
+			writeErr(w, http.StatusNotFound, "user not found")
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"user": u})
+		viewerID := ""
+		if u, ok := currentUser(r, store); ok {
+			viewerID = u.ID
+		}
+		profile, err := store.Profile(username, viewerID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeErr(w, http.StatusNotFound, "user not found")
+				return
+			}
+			writeErr(w, http.StatusInternalServerError, "failed to load profile")
+			return
+		}
+		writeJSON(w, http.StatusOK, profile)
 	})
+}
+
+// handleUpdateMe applies PATCH/PUT /api/auth/me changes to the signed-in
+// account. Fields are optional: username, bio, and a password change
+// (currentPassword + newPassword).
+func handleUpdateMe(w http.ResponseWriter, r *http.Request, store *Store) {
+	u, ok := requireUser(w, r, store)
+	if !ok {
+		return
+	}
+	var body struct {
+		Username        *string `json:"username"`
+		Bio             *string `json:"bio"`
+		CurrentPassword string  `json:"currentPassword"`
+		NewPassword     string  `json:"newPassword"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if body.NewPassword != "" {
+		if err := store.ChangePassword(u.ID, body.CurrentPassword, body.NewPassword); err != nil {
+			if errors.Is(err, ErrInvalidLogin) {
+				writeErr(w, http.StatusUnauthorized, "current password is incorrect")
+				return
+			}
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if body.Username != nil || body.Bio != nil {
+		updated, err := store.UpdateUser(u.ID, body.Username, body.Bio)
+		if err != nil {
+			if errors.Is(err, ErrUserExists) {
+				writeErr(w, http.StatusConflict, "username already taken")
+				return
+			}
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		u = updated
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"user": u})
 }
 
 func decodeCredentials(w http.ResponseWriter, r *http.Request) (username, password string, ok bool) {

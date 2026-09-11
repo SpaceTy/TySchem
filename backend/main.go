@@ -44,6 +44,7 @@ func main() {
 		log.Printf("prune sessions: %v", err)
 	}
 	registerAuthRoutes(mux, store)
+	registerUserRoutes(mux, store)
 	registerSchematicRoutes(mux, store)
 
 	// Static frontend with SPA fallback

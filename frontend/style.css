@@ -189,6 +189,19 @@ a:hover { color: #93c5fd; }
   transition: background .15s;
 }
 .profile-logout:hover { background: rgba(239,68,68,.2); }
+.profile-link {
+  width: 100%;
+  text-align: left;
+  padding: .6rem 1rem;
+  font-size: .55rem;
+  line-height: 1.7;
+  color: #cbd5e1;
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  transition: background .15s;
+}
+.profile-link:hover { background: rgba(255,255,255,.08); color: #fff; }
 
 .view-container {
   max-width: 52rem;
@@ -506,19 +519,20 @@ a:hover { color: #93c5fd; }
   aspect-ratio: 1 / 1;
   padding: .45rem;
   border-radius: .45rem;
-  background: rgba(239,68,68,.1);
-  border: 1px solid rgba(239,68,68,.35);
-  color: #ef4444;
+  background: rgba(239,68,68,.28);
+  border: 1px solid rgba(248,113,113,.7);
+  color: #fca5a5;
   font-family: inherit;
   font-size: .55rem;
   line-height: 1.5;
   cursor: pointer;
   transition: color .15s, background .15s, border-color .15s;
 }
-.like-btn:hover:not(:disabled) { color: #f87171; background: rgba(239,68,68,.18); border-color: rgba(248,113,113,.55); }
+.like-btn:hover:not(:disabled) { color: #fecaca; background: rgba(239,68,68,.38); border-color: rgba(248,113,113,.9); }
 .like-btn:disabled { opacity: .5; cursor: default; }
 .like-btn .heart-icon { width: 1.5em; height: 1.5em; fill: currentColor; }
-.like-btn.liked { color: #fca5a5; border-color: rgba(248,113,113,.7); background: rgba(239,68,68,.28); }
+.like-btn.liked { color: #ef4444; border-color: rgba(239,68,68,.35); background: rgba(239,68,68,.1); }
+.like-btn.liked:hover:not(:disabled) { color: #f87171; background: rgba(239,68,68,.18); border-color: rgba(248,113,113,.55); }
 .like-btn .like-count {
   position: absolute;
   top: -.3rem;
@@ -566,9 +580,9 @@ a:hover { color: #93c5fd; }
   18% { opacity: .9; }
   100% { opacity: 0; transform: translate(calc(-50% + var(--dx, 0px)), calc(-50% + var(--dy, 60px))) scale(.3) rotate(var(--rot, 0deg)); }
 }
-.rail-btn.like-rail { flex-direction: column; gap: .15rem; color: #ef4444; }
+.rail-btn.like-rail { flex-direction: column; gap: .15rem; color: #fca5a5; border-color: rgba(248,113,113,.7); background: rgba(239,68,68,.28); }
 .rail-btn.like-rail .like-count { font-size: .45rem; line-height: 1; color: #94a3b8; }
-.rail-btn.like-rail.liked { color: #fca5a5; border-color: rgba(248,113,113,.7); background: rgba(239,68,68,.28); }
+.rail-btn.like-rail.liked { color: #ef4444; border-color: rgba(239,68,68,.35); background: rgba(239,68,68,.1); }
 .rail-btn.like-rail.liked .heart-icon { fill: currentColor; }
 
 .rating-widget {
@@ -969,6 +983,104 @@ a:hover { color: #93c5fd; }
   margin-top: 1.25rem;
 }
 
+/* ── Profile page ──────────────────────────────────────────── */
+.profile-layout {
+  display: grid;
+  grid-template-columns: minmax(16rem, 20rem) 1fr;
+  gap: 1.25rem;
+  align-items: stretch;
+  height: calc(100vh - 6rem);
+}
+@media (min-width: 768px) {
+  body.profile-page { overflow: hidden; }
+  body.profile-page .site-header { padding-bottom: 1.6rem; }
+  body.profile-page .site-footer { display: none; }
+  body.profile-page #app { height: 100vh; min-height: 0; }
+  body.profile-page .view-container {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+  body.profile-page .profile-layout {
+    flex: 1;
+    height: auto;
+    min-height: 0;
+  }
+}
+.profile-side {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  min-height: 0;
+}
+.profile-schematics {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  min-height: 0;
+  overflow-y: auto;
+}
+.profile-header {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1.1rem;
+}
+.profile-header-main { display: flex; align-items: center; gap: 1.1rem; min-width: 0; }
+.profile-avatar {
+  width: 4.25rem;
+  height: 4.25rem;
+  border-radius: 9999px;
+  background: rgba(37,99,235,.8);
+  border: 1px solid rgba(147,197,253,.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: 700;
+  text-transform: uppercase;
+  font-size: 1.4rem;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.profile-identity { min-width: 0; }
+.profile-username { margin-bottom: .5rem; }
+.profile-bio { font-size: .56rem; color: #94a3b8; line-height: 1.9; white-space: pre-wrap; }
+.profile-joined { font-size: .5rem; color: #64748b; margin-top: .4rem; letter-spacing: .02em; }
+.profile-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: .9rem;
+}
+.stat-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: .4rem;
+  padding: 1rem .75rem;
+  border-radius: .85rem;
+  background: rgba(255,255,255,.03);
+  border: 1px solid rgba(255,255,255,.08);
+}
+.stat-value { font-size: 1rem; color: #bfdbfe; line-height: 1.4; }
+.stat-label {
+  font-size: .48rem;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  line-height: 1.6;
+}
+.profile-section { display: flex; flex-direction: column; gap: .85rem; }
+.profile-section-title {
+  font-size: .68rem;
+  color: #e2e8f0;
+  font-weight: 400;
+  line-height: 1.7;
+}
+.owner-link { color: #93c5fd; }
+.owner-link:hover { color: #bfdbfe; text-decoration: underline; }
+
 /* ── Animations ────────────────────────────────────────────── */
 .fade-in { animation: fadeIn .4s ease-out; }
 @keyframes fadeIn { from { opacity:0; transform:translateY(14px); } to { opacity:1; transform:translateY(0); } }
@@ -1003,6 +1115,8 @@ a:hover { color: #93c5fd; }
     width: auto;
   }
   .detail-rail .rail-btn { width: 2.4rem; flex: 0 0 auto; }
+  .profile-layout { grid-template-columns: 1fr; height: auto; }
+  .profile-side, .profile-schematics { overflow: visible; }
   .nav-sub { display: none; }
 }
 @media (max-width: 640px) {
@@ -1015,4 +1129,6 @@ a:hover { color: #93c5fd; }
   .toolbar { flex-direction: column; align-items: stretch; }
   .meta-grid { grid-template-columns: 1fr; }
   .schematics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .profile-header { flex-direction: column; align-items: stretch; }
+  .profile-avatar { width: 3.25rem; height: 3.25rem; font-size: 1.1rem; }
 }

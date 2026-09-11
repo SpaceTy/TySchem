@@ -86,6 +86,21 @@ const API = {
     if (!r.ok) return null;
     return (await r.json()).user;
   },
+  async updateMe(body) {
+    const r = await fetch('/api/auth/me', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || 'update failed');
+    return data.user;
+  },
+  async profile(username) {
+    const r = await fetch('/api/users/' + encodeURIComponent(username));
+    if (!r.ok) throw new Error('not found');
+    return r.json();
+  },
 };
 
 // Shared fetch for rating/like actions: maps auth failures to sign-in prompts.
@@ -145,6 +160,7 @@ function renderAuthNav() {
             <p class="profile-dropdown-user">${esc(currentUser.username)}</p>
           </div>
           <div class="profile-dropdown-body">
+            <a class="profile-link" href="#/user/${encodeURIComponent(currentUser.username)}"><span>&#128100;</span> My Profile</a>
             <button class="profile-logout" id="logout-btn" type="button"><span>&#10132;</span> Logout</button>
           </div>
         </div>
@@ -609,6 +625,7 @@ function route() {
   if (_viewCleanup) { try { _viewCleanup(); } catch {} _viewCleanup = null; }
   $view.classList.remove('view-wide');
   document.body.classList.remove('detail-view');
+  document.body.classList.remove('profile-page');
   const navSub = document.getElementById('nav-sub');
   if (navSub) { navSub.hidden = true; }
   const navSubText = document.getElementById('nav-sub-text');
@@ -628,6 +645,7 @@ function route() {
   if (parts[0] === 'mine') { renderList({ owner: 'me' }); return; }
   if (parts[0] === 'upload') { renderUpload(); return; }
   if (parts[0] === 'schematic' && parts[1]) { renderDetail(parts[1]); return; }
+  if (parts[0] === 'user' && parts[1]) { renderProfile(decodeURIComponent(parts.slice(1).join('/'))); return; }
   $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Not found</h2></div>';
 }
 window.addEventListener('hashchange', route);
@@ -1173,7 +1191,7 @@ async function renderDetail(id) {
           <span class="rating-summary">${ratingSummaryText(meta)}</span>
         </div>
         <div class="meta-grid">
-          <div class="meta-item"><span class="meta-label">Uploader</span><span class="meta-value">${esc(meta.ownerName || 'anonymous')}</span></div>
+          <div class="meta-item"><span class="meta-label">Uploader</span><span class="meta-value">${meta.ownerName ? `<a class="owner-link" href="#/user/${encodeURIComponent(meta.ownerName)}">${esc(meta.ownerName)}</a>` : 'anonymous'}</span></div>
           <div class="meta-item"><span class="meta-label">File Size</span><span class="meta-value">${fmtBytes(meta.size)}</span></div>
           <div class="meta-item"><span class="meta-label">Uploaded</span><span class="meta-value">${fmtDateTime(meta.uploadDate)}</span></div>
         </div>
@@ -1318,6 +1336,132 @@ function openEditPopover(anchor, meta, id) {
     }
   });
   pop.querySelector('#pop-edit-name')?.focus();
+}
+
+// ───────────────────────────────────────────────────────────────
+//  Profile view
+// ───────────────────────────────────────────────────────────────
+function profileGridHtml(items, emptyText) {
+  if (!items || !items.length) {
+    return `<div class="empty-state panel"><p class="empty-text">${esc(emptyText)}</p></div>`;
+  }
+  return `<div class="schematics-grid">${items.map(cardHtml).join('')}</div>`;
+}
+
+async function renderProfile(username) {
+  $view.innerHTML = '<div class="panel fade-in"><div class="empty-state"><p class="empty-text">Loading...</p></div></div>';
+
+  let profile;
+  try { profile = await API.profile(username); } catch {
+    $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">User not found</h2><a href="#/" class="button button-secondary">Back to schematics</a></div>';
+    return;
+  }
+
+  const { user, stats, best, latest } = profile;
+  const isSelf = !!currentUser && currentUser.id === user.id;
+  const initial = (user.username || '?').charAt(0).toUpperCase();
+  const avg = stats.ratings ? stats.avgRating.toFixed(1) : '\u2014';
+
+  $view.classList.add('view-wide');
+  document.body.classList.add('profile-page');
+  $view.innerHTML = `
+    <div class="fade-in profile-layout">
+      <aside class="profile-side">
+        <div class="panel profile-header">
+          <div class="profile-header-main">
+            <span class="profile-avatar">${esc(initial)}</span>
+            <div class="profile-identity">
+              <h2 class="page-title profile-username">${esc(user.username)}</h2>
+              <p class="profile-bio">${user.bio ? esc(user.bio) : (isSelf ? 'No bio yet. Add one to tell people about yourself.' : 'No bio yet.')}</p>
+              <p class="profile-joined">Member since ${fmtDate(user.createdAt)}</p>
+            </div>
+          </div>
+          ${isSelf ? '<button type="button" class="button button-secondary button-sm" id="edit-profile-btn">Edit profile</button>' : ''}
+        </div>
+        <div class="profile-stats">
+          <div class="stat-card"><span class="stat-value">${stats.uploads}</span><span class="stat-label">Uploads</span></div>
+          <div class="stat-card"><span class="stat-value">${stats.likes}</span><span class="stat-label">Likes</span></div>
+          <div class="stat-card"><span class="stat-value">${avg}</span><span class="stat-label">Avg rating</span></div>
+          <div class="stat-card"><span class="stat-value">${stats.ratings}</span><span class="stat-label">Ratings</span></div>
+        </div>
+      </aside>
+      <div class="panel profile-schematics">
+        <section class="profile-section">
+          <h3 class="profile-section-title">Best schematics</h3>
+          <div id="profile-best">${profileGridHtml(best, 'No schematics uploaded yet.')}</div>
+        </section>
+        <section class="profile-section">
+          <h3 class="profile-section-title">Latest schematics</h3>
+          <div id="profile-latest">${profileGridHtml(latest, 'No schematics uploaded yet.')}</div>
+        </section>
+      </div>
+    </div>`;
+
+  mountListCards(Array.from($view.querySelectorAll('.schematic-card')));
+
+  document.getElementById('edit-profile-btn')?.addEventListener('click', e => {
+    const btn = e.currentTarget;
+    if (btn.__popover) { btn.__popover.close(); return; }
+    openProfileEditPopover(btn, user);
+  });
+}
+
+function openProfileEditPopover(anchor, user) {
+  const { pop, close } = createPopover(anchor, `
+    <h3 class="dialog-title">Edit Profile</h3>
+    <form id="profile-edit-form" autocomplete="off">
+      <div class="form-group">
+        <label class="label" for="pop-profile-name">Username</label>
+        <input class="input" id="pop-profile-name" value="${esc(user.username)}" minlength="3" maxlength="32" required />
+      </div>
+      <div class="form-group">
+        <label class="label" for="pop-profile-bio">Bio</label>
+        <textarea class="textarea" id="pop-profile-bio" maxlength="500" placeholder="Tell people about yourself...">${esc(user.bio || '')}</textarea>
+      </div>
+      <div class="form-group">
+        <label class="label" for="pop-profile-current">Current password</label>
+        <input class="input" id="pop-profile-current" type="password" autocomplete="current-password" placeholder="Only needed to change password" />
+      </div>
+      <div class="form-group">
+        <label class="label" for="pop-profile-new">New password</label>
+        <input class="input" id="pop-profile-new" type="password" autocomplete="new-password" minlength="8" maxlength="72" placeholder="Leave blank to keep current" />
+      </div>
+      <div class="dialog-actions">
+        <button type="button" class="button button-secondary" data-act="cancel">Cancel</button>
+        <button type="submit" class="button button-primary" data-act="save">Save Changes</button>
+      </div>
+    </form>`);
+
+  pop.querySelector('[data-act="cancel"]').addEventListener('click', close);
+  pop.querySelector('#profile-edit-form').addEventListener('submit', async e => {
+    e.preventDefault();
+    const btn = pop.querySelector('[data-act="save"]');
+    const newPassword = pop.querySelector('#pop-profile-new').value;
+    const body = {
+      username: pop.querySelector('#pop-profile-name').value.trim(),
+      bio: pop.querySelector('#pop-profile-bio').value.trim(),
+    };
+    if (newPassword) {
+      body.currentPassword = pop.querySelector('#pop-profile-current').value;
+      body.newPassword = newPassword;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Saving...';
+    try {
+      const updated = await API.updateMe(body);
+      currentUser = updated;
+      renderAuthNav();
+      toast('Profile updated');
+      close();
+      if (updated.username !== user.username) location.hash = '#/user/' + encodeURIComponent(updated.username);
+      else renderProfile(updated.username);
+    } catch (err) {
+      toast(err.message || 'Update failed', 'error');
+      btn.disabled = false;
+      btn.textContent = 'Save Changes';
+    }
+  });
+  pop.querySelector('#pop-profile-name')?.focus();
 }
 
 // ───────────────────────────────────────────────────────────────

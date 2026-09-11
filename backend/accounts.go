@@ -18,6 +18,7 @@ type User struct {
 	ID           string    `json:"id"`
 	Username     string    `json:"username"`
 	PasswordHash string    `json:"-"`
+	Bio          string    `json:"bio"`
 	CreatedAt    time.Time `json:"createdAt"`
 }
 
@@ -27,6 +28,7 @@ const (
 	usernameMaxLen  = 32
 	passwordMinLen  = 8
 	passwordMaxLen  = 72 // bcrypt only hashes the first 72 bytes
+	bioMaxLen       = 500
 )
 
 var (
@@ -121,8 +123,8 @@ func (s *Store) GetUser(id string) (User, error) {
 	var u User
 	var created string
 	err := s.db.QueryRow(
-		`SELECT id, username, password_hash, created_at FROM users WHERE id = ?`, id,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &created)
+		`SELECT id, username, password_hash, bio, created_at FROM users WHERE id = ?`, id,
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Bio, &created)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrUnauthorized
@@ -135,6 +137,86 @@ func (s *Store) GetUser(id string) (User, error) {
 	return u, nil
 }
 
+// GetUserByUsername looks up an account by its case-insensitive username.
+// Returns sql.ErrNoRows when no such account exists.
+func (s *Store) GetUserByUsername(username string) (User, error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return User{}, sql.ErrNoRows
+	}
+	var u User
+	var created string
+	err := s.db.QueryRow(
+		`SELECT id, username, password_hash, bio, created_at FROM users WHERE username = ?`,
+		username,
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Bio, &created)
+	if err != nil {
+		return User{}, err
+	}
+	if u.CreatedAt, err = parseTime(created); err != nil {
+		return User{}, err
+	}
+	return u, nil
+}
+
+// UpdateUser changes username and/or bio for an account. Pass nil for fields
+// to leave untouched. A duplicate username yields ErrUserExists.
+func (s *Store) UpdateUser(id string, username, bio *string) (User, error) {
+	if !validID(id) {
+		return User{}, ErrUnauthorized
+	}
+	var sets []string
+	var args []any
+	if username != nil {
+		name := strings.TrimSpace(*username)
+		if !validUsername(name) {
+			return User{}, fmt.Errorf("username must be %d-%d characters (letters, digits, _ or -)", usernameMinLen, usernameMaxLen)
+		}
+		sets = append(sets, "username = ?")
+		args = append(args, name)
+	}
+	if bio != nil {
+		b := strings.TrimSpace(*bio)
+		if len(b) > bioMaxLen {
+			return User{}, fmt.Errorf("bio must be <= %d characters", bioMaxLen)
+		}
+		sets = append(sets, "bio = ?")
+		args = append(args, b)
+	}
+	if len(sets) == 0 {
+		return s.GetUser(id)
+	}
+	args = append(args, id)
+	if _, err := s.db.Exec(`UPDATE users SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
+		if isUniqueViolation(err) {
+			return User{}, ErrUserExists
+		}
+		return User{}, err
+	}
+	return s.GetUser(id)
+}
+
+// ChangePassword verifies currentPassword and replaces the hash with one for
+// newPassword. A wrong current password yields ErrInvalidLogin.
+func (s *Store) ChangePassword(id, currentPassword, newPassword string) error {
+	u, err := s.GetUser(id)
+	if err != nil {
+		return err
+	}
+	if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(currentPassword)) != nil {
+		return ErrInvalidLogin
+	}
+	if len(newPassword) < passwordMinLen || len(newPassword) > passwordMaxLen {
+		return fmt.Errorf("password must be %d-%d characters", passwordMinLen, passwordMaxLen)
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE users SET password_hash = ? WHERE id = ?`, string(hash), id)
+	return err
+}
+
 // Authenticate verifies a username/password pair, returning a generic error
 // on any failure so callers cannot distinguish unknown users from bad passwords.
 func (s *Store) Authenticate(username, password string) (User, error) {
@@ -142,9 +224,9 @@ func (s *Store) Authenticate(username, password string) (User, error) {
 	var u User
 	var created string
 	err := s.db.QueryRow(
-		`SELECT id, username, password_hash, created_at FROM users WHERE username = ?`,
+		`SELECT id, username, password_hash, bio, created_at FROM users WHERE username = ?`,
 		username,
-	).Scan(&u.ID, &u.Username, &u.PasswordHash, &created)
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Bio, &created)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			// Spend roughly the same time as a real compare to avoid user-enumeration timing.
@@ -206,11 +288,11 @@ func (s *Store) UserForSession(token string) (User, error) {
 	var u User
 	var created string
 	err := s.db.QueryRow(`
-		SELECT u.id, u.username, u.created_at
+		SELECT u.id, u.username, u.bio, u.created_at
 		FROM sessions s JOIN users u ON u.id = s.user_id
 		WHERE s.token = ? AND s.expires_at > ?`,
 		hashToken(token), formatTime(time.Now().UTC()),
-	).Scan(&u.ID, &u.Username, &created)
+	).Scan(&u.ID, &u.Username, &u.Bio, &created)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrUnauthorized
