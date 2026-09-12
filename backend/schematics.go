@@ -423,7 +423,8 @@ func (s *Store) Update(id string, name, description *string) (SchematicMetadata,
 	return s.Get(id)
 }
 
-// Delete removes both blob and metadata row. Missing ID => ErrNotFound.
+// Delete removes the blob, metadata row and all dependent feedback
+// (ratings, likes, project membership). Missing ID => ErrNotFound.
 func (s *Store) Delete(id string) error {
 	if !validID(id) {
 		return ErrNotFound
@@ -432,10 +433,21 @@ func (s *Store) Delete(id string) error {
 	if err := os.Remove(s.FilePath(id)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	if _, err := s.db.Exec(`DELETE FROM project_schematics WHERE schematic_id = ?`, id); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return err
 	}
-	res, err := s.db.Exec(`DELETE FROM schematics WHERE id = ?`, id)
+	defer tx.Rollback()
+	for _, q := range []string{
+		`DELETE FROM ratings WHERE schematic_id = ?`,
+		`DELETE FROM likes WHERE schematic_id = ?`,
+		`DELETE FROM project_schematics WHERE schematic_id = ?`,
+	} {
+		if _, err := tx.Exec(q, id); err != nil {
+			return err
+		}
+	}
+	res, err := tx.Exec(`DELETE FROM schematics WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
@@ -446,7 +458,7 @@ func (s *Store) Delete(id string) error {
 	if n == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 // escapeLike escapes %, _ and the escape char for a LIKE pattern.

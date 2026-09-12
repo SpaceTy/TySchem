@@ -14,6 +14,21 @@ Run from repo root (Makefile `cd`s into `backend/`):
 
 There is no lint/format config; use standard `gofmt` / `go vet`.
 
+To exercise the API against a local server, run the server and the `curl`
+checks inside a single self-contained script that kills the server before it
+exits. Do not start it with a bare trailing `&` (or `nohup`/`setsid`) in a
+standalone tool call: the shell waits on the background process's open
+stdout/stderr and the call hangs until it times out. Point `DATA_DIR` and
+`CONFIG_FILE` at temp paths so a test run never touches the repo's `data/` or
+`config.toml`, e.g.:
+
+```sh
+CONFIG_FILE=/tmp/t.toml FRONTEND_DIR=frontend DATA_DIR=$(mktemp -d) PORT=18080 ./tyschem &
+srv=$!
+# ... curl ...
+kill "$srv"
+```
+
 ## Layout
 
 - `backend/` — package `main`, Go 1.21. Entrypoint `main.go`; store/models in `schematics.go` + `accounts.go`; config in `config.go`; HTTP handlers in `*_handlers.go` (admin routes in `admin_handlers.go`). Routes are dispatched manually in `register*Routes` (no router library).

@@ -208,27 +208,26 @@ func handleUpdateMe(w http.ResponseWriter, r *http.Request, store *Store) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if body.NewPassword != "" {
-		if err := store.ChangePassword(u.ID, body.CurrentPassword, body.NewPassword); err != nil {
-			if errors.Is(err, ErrInvalidLogin) {
-				writeErr(w, http.StatusUnauthorized, "current password is incorrect")
-				return
-			}
+	updated, passwordChanged, err := store.UpdateAccount(u.ID, body.Username, body.Bio, body.CurrentPassword, body.NewPassword)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrInvalidLogin):
+			writeErr(w, http.StatusUnauthorized, "current password is incorrect")
+		case errors.Is(err, ErrUserExists):
+			writeErr(w, http.StatusConflict, "username already taken")
+		default:
 			writeErr(w, http.StatusBadRequest, err.Error())
-			return
 		}
+		return
 	}
-	if body.Username != nil || body.Bio != nil {
-		updated, err := store.UpdateUser(u.ID, body.Username, body.Bio)
-		if err != nil {
-			if errors.Is(err, ErrUserExists) {
-				writeErr(w, http.StatusConflict, "username already taken")
-				return
-			}
-			writeErr(w, http.StatusBadRequest, err.Error())
+	u = updated
+	if passwordChanged {
+		// The password change revoked every session; issue a fresh one so the
+		// caller stays signed in while other sessions are invalidated.
+		if err := startSession(w, r, store, u); err != nil {
+			writeErr(w, http.StatusInternalServerError, "failed to create session")
 			return
 		}
-		u = updated
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"user": u})
 }

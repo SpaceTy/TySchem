@@ -1212,6 +1212,11 @@ a:hover { color: #93c5fd; }
   gap: 1rem;
   margin-top: 1.5rem;
 }
+.projects-more {
+  display: flex;
+  justify-content: center;
+  margin-top: 1.25rem;
+}
 .project-card {
   display: flex;
   flex-direction: column;

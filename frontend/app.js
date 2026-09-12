@@ -4,17 +4,17 @@
 //  API client
 // ───────────────────────────────────────────────────────────────
 const API = {
-  async list(params = {}) {
+  async list(params = {}, signal) {
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) {
       if (v !== '' && v !== null && v !== undefined) q.set(k, v);
     }
-    const r = await fetch('/api/schematics?' + q);
+    const r = await fetch('/api/schematics?' + q, { signal });
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
-  async get(id) {
-    const r = await fetch('/api/schematics/' + id);
+  async get(id, signal) {
+    const r = await fetch('/api/schematics/' + id, { signal });
     if (!r.ok) throw new Error('not found');
     return r.json();
   },
@@ -96,23 +96,23 @@ const API = {
     if (!r.ok) throw new Error(data.error || 'update failed');
     return data.user;
   },
-  async profile(username) {
-    const r = await fetch('/api/users/' + encodeURIComponent(username));
+  async profile(username, signal) {
+    const r = await fetch('/api/users/' + encodeURIComponent(username), { signal });
     if (!r.ok) throw new Error('not found');
     return r.json();
   },
   // Projects group schematics into an ordered, many-to-many set.
-  async listProjects(params = {}) {
+  async listProjects(params = {}, signal) {
     const q = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) {
       if (v !== '' && v !== null && v !== undefined) q.set(k, v);
     }
-    const r = await fetch('/api/projects?' + q);
+    const r = await fetch('/api/projects?' + q, { signal });
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   },
-  async getProject(id) {
-    const r = await fetch('/api/projects/' + encodeURIComponent(id));
+  async getProject(id, signal) {
+    const r = await fetch('/api/projects/' + encodeURIComponent(id), { signal });
     if (!r.ok) throw new Error('not found');
     return r.json();
   },
@@ -143,8 +143,8 @@ const API = {
     });
   },
   // Admin-only account management.
-  async adminUsers() {
-    const r = await fetch('/api/admin/users');
+  async adminUsers(signal) {
+    const r = await fetch('/api/admin/users', { signal });
     if (r.status === 401) onUnauthorized();
     if (!r.ok) throw new Error('failed to load users');
     return r.json();
@@ -382,7 +382,10 @@ function confirm(anchor, title, message, confirmLabel = 'Delete') {
 //  Utilities
 // ───────────────────────────────────────────────────────────────
 const view = () => document.getElementById('view');
-function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+// Accepts any value (including numbers) but must be given a string to encode.
+// Quotes are escaped too so the result is safe inside double-quoted HTML
+// attributes as well as in element content.
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
 
 function fmtBytes(n) {
   if (n < 1024) return n + ' B';
@@ -475,16 +478,17 @@ function orbitCamera(structure, theta, phi, margin) {
 
 // ── Card thumbnails ─────────────────────────────────────────
 const _thumbCache = new Map();     // id -> dataURL
-const _thumbPending = new Set();   // ids currently queued/rendering
+const _thumbPending = new Map();   // id -> [imgEl, ...] queued/rendering
 const _thumbQueue = [];
 let _thumbRunning = false;
 
 function requestThumbnail(id, imgEl) {
   if (!id || !imgEl) return;
   if (_thumbCache.has(id)) { setThumb(imgEl, _thumbCache.get(id)); return; }
-  if (_thumbPending.has(id)) return;
-  _thumbPending.add(id);
-  _thumbQueue.push({ id, imgEl });
+  const waiters = _thumbPending.get(id);
+  if (waiters) { waiters.push(imgEl); return; }
+  _thumbPending.set(id, [imgEl]);
+  _thumbQueue.push({ id });
   pumpThumbQueue();
 }
 
@@ -493,13 +497,14 @@ async function pumpThumbQueue() {
   _thumbRunning = true;
   while (_thumbQueue.length) {
     const job = _thumbQueue.shift();
+    const waiters = _thumbPending.get(job.id) || [];
     try {
       const url = _thumbCache.get(job.id) || await renderThumbnail(job.id);
       _thumbCache.set(job.id, url);
-      if (job.imgEl.isConnected) setThumb(job.imgEl, url);
+      for (const el of waiters) { if (el.isConnected) setThumb(el, url); }
     } catch (err) {
       console.warn('[tyschem] thumbnail failed for', job.id, err);
-      job.imgEl.closest('.card-thumb')?.classList.add('thumb-error');
+      for (const el of waiters) el.closest('.card-thumb')?.classList.add('thumb-error');
     } finally {
       _thumbPending.delete(job.id);
     }
@@ -704,6 +709,12 @@ function setViewCleanup(fn) {
   _viewCleanup = fn;
 }
 
+// Signal for the route currently being rendered. Renderers capture it and
+// check isStale() after every await so a slow response cannot paint over the
+// view that a newer navigation installed.
+function routeSignal() { return _currentAbort ? _currentAbort.signal : undefined; }
+function isStale(signal) { return !!signal && signal.aborted; }
+
 // Context chip under the nav; aligned beneath whichever section is active.
 function positionNavSub() {
   const navSub = document.getElementById('nav-sub');
@@ -778,6 +789,15 @@ let _listScrollY = 0;       // saved window scroll for restoring on return
 // whether returning to the browse view should restore or start fresh.
 function listSignature(s) {
   return [s.owner || '', s.q || '', s.author || '', s.sort, s.order].join('|');
+}
+
+// Drops the cached browse result so returning to the list refetches instead of
+// restoring stale cards. Call after any schematic create/update/delete.
+function invalidateList() {
+  _listSignature = '';
+  _listItems = [];
+  _listTotal = 0;
+  _listRendered = 0;
 }
 
 const sortLabels = { uploadDate: 'Upload date', updatedDate: 'Updated date', name: 'Name', size: 'Size', rating: 'Rating', likes: 'Likes' };
@@ -902,6 +922,7 @@ async function reloadList() {
 // Fetches the next page of the current (filtered) result set and appends it.
 async function loadList() {
   const s = _listState;
+  const signal = routeSignal();
   const seq = ++_listSeq;
   _listLoading = true;
   if (_listItems.length) setListStatus('loading', 'Loading more...');
@@ -909,13 +930,13 @@ async function loadList() {
     const data = await API.list({
       q: s.q, author: s.author, sort: s.sort, order: s.order,
       limit: s.limit, offset: _listItems.length, owner: s.owner,
-    });
-    if (seq !== _listSeq) return;   // a newer request superseded this one
+    }, signal);
+    if (seq !== _listSeq || isStale(signal)) return;   // a newer request/route superseded this one
     _listTotal = data.total || 0;
     if (data.items && data.items.length) _listItems = _listItems.concat(data.items);
     renderListBody();
   } catch (err) {
-    if (err.name === 'AbortError' || seq !== _listSeq) return;
+    if (err.name === 'AbortError' || seq !== _listSeq || isStale(signal)) return;
     const el = document.getElementById('list-body');
     if (el && !_listItems.length) {
       el.innerHTML = '<div class="empty-state"><p class="empty-text" style="color:#ef4444">Failed to load schematics.</p></div>';
@@ -1104,15 +1125,17 @@ function spawnHearts(btn, liked) {
 async function onLikeClick(btn, id) {
   if (btn.disabled) return;
   if (!currentUser) { toast('Sign in to like schematics', 'error'); location.hash = '#/login'; return; }
+  const signal = routeSignal();
   btn.disabled = true;
   try {
     const meta = await API.toggleLike(id);
+    if (isStale(signal)) return;
     applyLikeState(btn, meta);
     spawnHearts(btn, meta.liked);
     const item = _listItems.find(x => x.id === id);
     if (item) { item.liked = meta.liked; item.likeCount = meta.likeCount; }
   } catch (err) {
-    toast(err.message || 'Failed to update like', 'error');
+    if (!isStale(signal)) toast(err.message || 'Failed to update like', 'error');
   } finally {
     btn.disabled = false;
   }
@@ -1291,21 +1314,49 @@ async function renderUpload() {
   form.addEventListener('dragleave', () => form.classList.remove('drag-over'));
   form.addEventListener('drop', e => { e.preventDefault(); form.classList.remove('drag-over'); if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]); });
 
-  API.listProjects({ owner: 'me', limit: 200 }).then(data => {
+  const uploadSignal = routeSignal();
+  let uploadProjects = [];
+  let uploadProjectsTotal = 0;
+  const uploadSelected = new Set();
+  document.getElementById('upload-projects')?.addEventListener('change', e => {
+    const input = e.target.closest('input[type="checkbox"]');
+    if (!input) return;
+    if (input.checked) uploadSelected.add(input.value);
+    else uploadSelected.delete(input.value);
+  });
+  function renderUploadProjects() {
     const el = document.getElementById('upload-projects');
     if (!el) return;
-    const projects = data.items || [];
-    el.innerHTML = projects.length
-      ? projects.map(p => `<label class="add-schem-item"><input type="checkbox" value="${p.id}" /> <span>${esc(p.name)}</span></label>`).join('')
-      : '<span class="form-hint">You have no projects yet. <a href="#/projects">Create one</a>.</span>';
-  }).catch(() => {
+    if (!uploadProjects.length) {
+      el.innerHTML = '<span class="form-hint">You have no projects yet. <a href="#/projects">Create one</a>.</span>';
+      return;
+    }
+    el.innerHTML = uploadProjects.map(p => `<label class="add-schem-item"><input type="checkbox" value="${p.id}"${uploadSelected.has(p.id) ? ' checked' : ''} /> <span>${esc(p.name)}</span></label>`).join('')
+      + (uploadProjects.length < uploadProjectsTotal
+        ? '<button type="button" class="button button-secondary button-sm" id="upload-projects-more">Load more projects</button>'
+        : '');
+    document.getElementById('upload-projects-more')?.addEventListener('click', loadUploadProjects);
+  }
+  async function loadUploadProjects() {
     const el = document.getElementById('upload-projects');
-    if (el) el.innerHTML = '<span class="form-hint">Could not load projects.</span>';
-  });
+    if (!el) return;
+    try {
+      const data = await API.listProjects({ owner: 'me', limit: 100, offset: uploadProjects.length }, uploadSignal);
+      if (isStale(uploadSignal)) return;
+      uploadProjectsTotal = data.total || 0;
+      uploadProjects = uploadProjects.concat(data.items || []);
+      renderUploadProjects();
+    } catch (err) {
+      if (isStale(uploadSignal) || err.name === 'AbortError') return;
+      el.innerHTML = '<span class="form-hint">Could not load projects.</span>';
+    }
+  }
+  loadUploadProjects();
 
   form.addEventListener('submit', async e => {
     e.preventDefault();
     if (!chosenFile) return;
+    const signal = routeSignal();
     const errEl = document.getElementById('upload-error');
     errEl.style.display = 'none';
     btn.disabled = true;
@@ -1313,7 +1364,7 @@ async function renderUpload() {
     document.getElementById('upload-progress-wrap').style.display = '';
     const bar = document.getElementById('upload-bar');
 
-    const projectIds = Array.from(document.querySelectorAll('#upload-projects input:checked')).map(i => i.value);
+    const projectIds = Array.from(uploadSelected);
     const fd = new FormData();
     fd.append('file', chosenFile);
     fd.append('name', document.getElementById('upload-name').value.trim());
@@ -1324,9 +1375,12 @@ async function renderUpload() {
       for (const pid of projectIds) {
         try { await API.addProjectSchematic(pid, meta.id); } catch {}
       }
+      invalidateList();
+      if (isStale(signal)) return;
       toast('Schematic uploaded');
       location.hash = '#/schematic/' + meta.id;
     } catch (err) {
+      if (isStale(signal)) return;
       errEl.textContent = err.message || 'Upload failed';
       errEl.style.display = '';
       btn.disabled = false;
@@ -1340,13 +1394,16 @@ async function renderUpload() {
 //  Detail view
 // ───────────────────────────────────────────────────────────────
 async function renderDetail(id) {
+  const signal = routeSignal();
   $view.innerHTML = '<div class="panel fade-in"><div class="empty-state"><p class="empty-text">Loading...</p></div></div>';
 
   let meta;
-  try { meta = await API.get(id); } catch {
+  try { meta = await API.get(id, signal); } catch {
+    if (isStale(signal)) return;
     $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Schematic not found</h2><a href="#/" class="button button-secondary">Back to list</a></div>';
     return;
   }
+  if (isStale(signal)) return;
 
   const dlUrl    = API.downloadUrl(id);
   const owner    = canManage(meta);
@@ -1410,21 +1467,27 @@ async function renderDetail(id) {
   });
 
   document.getElementById('detail-delete')?.addEventListener('click', async e => {
+    const signal = routeSignal();
     const btn = e.currentTarget;
     if (btn.__popover) { btn.__popover.close(); return; }
     const ok = await confirm(btn, 'Delete Schematic', `Are you sure you want to delete "${meta.name}"? This cannot be undone.`);
-    if (!ok) return;
+    if (!ok || isStale(signal)) return;
     try {
       await API.remove(id);
+      invalidateList();
+      if (isStale(signal)) return;
       toast('Schematic deleted');
       location.hash = '#/';
-    } catch { toast('Failed to delete', 'error'); }
+    } catch {
+      if (!isStale(signal)) toast('Failed to delete', 'error');
+    }
   });
 
   // Star rating (clicking your current rating clears it).
   const ratingEl = document.getElementById('detail-rating');
   if (ratingEl) {
     const onStar = async e => {
+      const signal = routeSignal();
       const btn = e.currentTarget;
       if (!currentUser) { toast('Sign in to rate schematics', 'error'); location.hash = '#/login'; return; }
       if (btn.disabled) return;
@@ -1432,12 +1495,13 @@ async function renderDetail(id) {
       const value = Number(btn.dataset.star);
       try {
         const updated = (meta.userRating === value) ? await API.unrate(id) : await API.rate(id, value);
+        if (isStale(signal)) return;
         Object.assign(meta, updated);
         ratingEl.querySelector('.stars').innerHTML = ratingStarsHtml(meta, true);
         ratingEl.querySelector('.rating-summary').textContent = ratingSummaryText(meta);
         ratingEl.querySelectorAll('.star-btn').forEach(b => b.addEventListener('click', onStar));
       } catch (err) {
-        toast(err.message || 'Failed to save rating', 'error');
+        if (!isStale(signal)) toast(err.message || 'Failed to save rating', 'error');
       } finally {
         btn.disabled = false;
       }
@@ -1447,17 +1511,19 @@ async function renderDetail(id) {
 
   // Like toggle in the action rail.
   document.getElementById('detail-like')?.addEventListener('click', async e => {
+    const signal = routeSignal();
     const btn = e.currentTarget;
     if (!currentUser) { toast('Sign in to like schematics', 'error'); location.hash = '#/login'; return; }
     if (btn.disabled) return;
     btn.disabled = true;
     try {
       const updated = await API.toggleLike(id);
+      if (isStale(signal)) return;
       Object.assign(meta, updated);
       applyLikeState(btn, meta);
       spawnHearts(btn, meta.liked);
     } catch (err) {
-      toast(err.message || 'Failed to update like', 'error');
+      if (!isStale(signal)) toast(err.message || 'Failed to update like', 'error');
     } finally {
       btn.disabled = false;
     }
@@ -1492,6 +1558,7 @@ function openEditPopover(anchor, meta, id) {
   pop.querySelector('[data-act="cancel"]').addEventListener('click', close);
   pop.querySelector('#edit-popover-form').addEventListener('submit', async e => {
     e.preventDefault();
+    const signal = routeSignal();
     const btn = pop.querySelector('[data-act="save"]');
     btn.disabled = true;
     btn.textContent = 'Saving...';
@@ -1500,10 +1567,13 @@ function openEditPopover(anchor, meta, id) {
         name: pop.querySelector('#pop-edit-name').value.trim(),
         description: pop.querySelector('#pop-edit-desc').value.trim(),
       });
-      toast('Schematic updated');
+      invalidateList();
       close();
+      if (isStale(signal)) return;
+      toast('Schematic updated');
       route();
     } catch (err) {
+      if (isStale(signal)) return;
       toast(err.message || 'Update failed', 'error');
       btn.disabled = false;
       btn.textContent = 'Save Changes';
@@ -1534,6 +1604,7 @@ function projectCardHtml(p) {
 }
 
 async function renderProjects() {
+  const signal = routeSignal();
   $view.classList.add('view-wide');
   $view.innerHTML = `
     <div class="browse-view">
@@ -1542,6 +1613,7 @@ async function renderProjects() {
         ${currentUser ? '<button type="button" class="button button-primary button-sm" id="new-project-btn">New project</button>' : ''}
       </div>
       <div id="projects-body" class="fade-in"><div class="empty-state panel"><p class="empty-text">Loading...</p></div></div>
+      <div id="projects-more" class="projects-more"></div>
     </div>`;
 
   document.getElementById('new-project-btn')?.addEventListener('click', e => {
@@ -1550,23 +1622,59 @@ async function renderProjects() {
     openProjectCreatePopover(btn);
   });
 
-  let data;
-  try { data = await API.listProjects({ limit: 100 }); } catch {
-    const body = document.getElementById('projects-body');
-    if (!body) return;
-    body.innerHTML = '<div class="empty-state panel"><p class="empty-text" style="color:#ef4444">Failed to load projects.</p></div>';
-    return;
-  }
-  const body = document.getElementById('projects-body');
-  if (!body) return;
-  const items = data.items || [];
-  body.innerHTML = items.length
-    ? `<div class="projects-grid">${items.map(projectCardHtml).join('')}</div>`
-    : `<div class="empty-state panel">
+  const pageSize = 24;
+  let items = [];
+  let total = 0;
+  let loading = false;
+
+  function renderProjectsBody() {
+    const el = document.getElementById('projects-body');
+    if (!el) return;
+    const more = document.getElementById('projects-more');
+    if (!items.length) {
+      el.innerHTML = `<div class="empty-state panel">
          <div class="empty-icon">&#128193;</div>
          <p class="empty-text">No projects yet.</p>
          ${currentUser ? '<p class="empty-hint">Create a project to group your schematics.</p>' : ''}
        </div>`;
+      if (more) more.innerHTML = '';
+      return;
+    }
+    el.innerHTML = `<div class="projects-grid">${items.map(projectCardHtml).join('')}</div>`;
+    if (!more) return;
+    if (items.length < total) {
+      more.innerHTML = '<button type="button" class="button button-secondary button-sm" id="projects-more-btn">Load more projects</button>';
+      document.getElementById('projects-more-btn').addEventListener('click', loadPage);
+    } else {
+      more.innerHTML = `<span class="list-status">Showing all ${total} project${total === 1 ? '' : 's'}</span>`;
+    }
+  }
+
+  async function loadPage() {
+    if (loading) return;
+    loading = true;
+    const btn = document.getElementById('projects-more-btn');
+    if (btn) { btn.disabled = true; btn.textContent = 'Loading...'; }
+    try {
+      const data = await API.listProjects({ limit: pageSize, offset: items.length }, signal);
+      if (isStale(signal)) return;
+      total = data.total || 0;
+      items = items.concat(data.items || []);
+      renderProjectsBody();
+    } catch (err) {
+      if (isStale(signal) || err.name === 'AbortError') return;
+      const el = document.getElementById('projects-body');
+      if (el && !items.length) {
+        el.innerHTML = '<div class="empty-state panel"><p class="empty-text" style="color:#ef4444">Failed to load projects.</p></div>';
+      } else {
+        toast('Failed to load more projects', 'error');
+      }
+    } finally {
+      loading = false;
+    }
+  }
+
+  await loadPage();
 }
 
 function openProjectCreatePopover(anchor) {
@@ -1590,6 +1698,7 @@ function openProjectCreatePopover(anchor) {
   pop.querySelector('[data-act="cancel"]').addEventListener('click', close);
   pop.querySelector('#project-create-form').addEventListener('submit', async e => {
     e.preventDefault();
+    const signal = routeSignal();
     const btn = pop.querySelector('[data-act="save"]');
     btn.disabled = true;
     btn.textContent = 'Creating...';
@@ -1598,10 +1707,12 @@ function openProjectCreatePopover(anchor) {
         name: pop.querySelector('#pop-project-name').value.trim(),
         description: pop.querySelector('#pop-project-desc').value.trim(),
       });
-      toast('Project created');
       close();
+      if (isStale(signal)) return;
+      toast('Project created');
       location.hash = '#/project/' + created.id;
     } catch (err) {
+      if (isStale(signal)) return;
       toast(err.message || 'Failed to create project', 'error');
       btn.disabled = false;
       btn.textContent = 'Create';
@@ -1611,13 +1722,16 @@ function openProjectCreatePopover(anchor) {
 }
 
 async function renderProject(id) {
+  const signal = routeSignal();
   $view.innerHTML = '<div class="panel fade-in"><div class="empty-state"><p class="empty-text">Loading...</p></div></div>';
 
   let detail;
-  try { detail = await API.getProject(id); } catch {
+  try { detail = await API.getProject(id, signal); } catch {
+    if (isStale(signal)) return;
     $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Project not found</h2><a href="#/projects" class="button button-secondary">Back to projects</a></div>';
     return;
   }
+  if (isStale(signal)) return;
 
   const p = detail.project;
   const items = detail.schematics || [];
@@ -1665,15 +1779,19 @@ async function renderProject(id) {
     openProjectEditPopover(btn, p);
   });
   document.getElementById('project-delete')?.addEventListener('click', async e => {
+    const signal = routeSignal();
     const btn = e.currentTarget;
     if (btn.__popover) { btn.__popover.close(); return; }
     const ok = await confirm(btn, 'Delete Project', `Delete "${p.name}"? The schematics themselves will not be deleted.`);
-    if (!ok) return;
+    if (!ok || isStale(signal)) return;
     try {
       await API.deleteProject(id);
+      if (isStale(signal)) return;
       toast('Project deleted');
       location.hash = '#/projects';
-    } catch { toast('Failed to delete project', 'error'); }
+    } catch {
+      if (!isStale(signal)) toast('Failed to delete project', 'error');
+    }
   });
   document.getElementById('project-add')?.addEventListener('click', e => {
     const btn = e.currentTarget;
@@ -1715,6 +1833,7 @@ function renderProjectSchematics(items, owner, id) {
 
   grid.querySelectorAll('[data-move]').forEach(btn => btn.addEventListener('click', async e => {
     e.stopPropagation();
+    const signal = routeSignal();
     const card = e.currentTarget.closest('.schematic-card');
     const idx = items.findIndex(x => x.id === card.dataset.id);
     const swap = idx + (e.currentTarget.dataset.move === 'up' ? -1 : 1);
@@ -1722,26 +1841,29 @@ function renderProjectSchematics(items, owner, id) {
     [items[idx], items[swap]] = [items[swap], items[idx]];
     try {
       const updated = await API.setProjectSchematics(id, items.map(x => x.id));
+      if (isStale(signal)) return;
       items.length = 0;
       items.push(...(updated.schematics || []));
       renderProjectSchematics(items, owner, id);
     } catch (err) {
       [items[idx], items[swap]] = [items[swap], items[idx]];
-      toast(err.message || 'Failed to reorder', 'error');
+      if (!isStale(signal)) toast(err.message || 'Failed to reorder', 'error');
     }
   }));
 
   grid.querySelectorAll('[data-remove]').forEach(btn => btn.addEventListener('click', async e => {
     e.stopPropagation();
+    const signal = routeSignal();
     const card = e.currentTarget.closest('.schematic-card');
     try {
       const updated = await API.removeProjectSchematic(id, card.dataset.id);
+      if (isStale(signal)) return;
       items.length = 0;
       items.push(...(updated.schematics || []));
       renderProjectSchematics(items, owner, id);
       toast('Removed from project');
     } catch (err) {
-      toast(err.message || 'Failed to remove schematic', 'error');
+      if (!isStale(signal)) toast(err.message || 'Failed to remove schematic', 'error');
     }
   }));
 }
@@ -1767,6 +1889,7 @@ function openProjectEditPopover(anchor, project) {
   pop.querySelector('[data-act="cancel"]').addEventListener('click', close);
   pop.querySelector('#project-edit-form').addEventListener('submit', async e => {
     e.preventDefault();
+    const signal = routeSignal();
     const btn = pop.querySelector('[data-act="save"]');
     btn.disabled = true;
     btn.textContent = 'Saving...';
@@ -1775,10 +1898,12 @@ function openProjectEditPopover(anchor, project) {
         name: pop.querySelector('#pop-project-edit-name').value.trim(),
         description: pop.querySelector('#pop-project-edit-desc').value.trim(),
       });
-      toast('Project updated');
       close();
+      if (isStale(signal)) return;
+      toast('Project updated');
       renderProject(project.id);
     } catch (err) {
+      if (isStale(signal)) return;
       toast(err.message || 'Update failed', 'error');
       btn.disabled = false;
       btn.textContent = 'Save Changes';
@@ -1788,64 +1913,113 @@ function openProjectEditPopover(anchor, project) {
 }
 
 // Lets an owner append their own schematics to the project, in one batch.
+// Backed by the paginated list API so older uploads stay reachable: the
+// search box filters server-side and "Load more" fetches the next page.
 async function openAddSchematicsPopover(anchor, projectId, items) {
-  let mine;
-  try { mine = (await API.list({ owner: 'me', limit: 200 })).items || []; } catch {
-    toast('Failed to load your schematics', 'error');
-    return;
-  }
+  const signal = routeSignal();
   const existing = new Set(items.map(m => m.id));
-  const candidates = mine.filter(m => !existing.has(m.id));
+  const pageSize = 50;
+  let query = '';
+  let mine = [];
+  let total = 0;
+  let offset = 0;
 
-  const { pop, close } = createPopover(anchor, candidates.length ? `
+  const { pop, close } = createPopover(anchor, `
     <h3 class="dialog-title">Add Schematics</h3>
     <input class="input" id="add-schem-search" placeholder="Search your schematics..." />
-    <div class="add-schem-list" id="add-schem-list">
-      ${candidates.map(m => `<label class="add-schem-item" data-name="${esc((m.name || '').toLowerCase())}">
-        <input type="checkbox" value="${m.id}" />
-        <span>${esc(m.name)}</span>
-      </label>`).join('')}
-    </div>
+    <div class="add-schem-list" id="add-schem-list"></div>
+    <div id="add-schem-more" class="projects-more"></div>
     <div class="dialog-actions">
       <button type="button" class="button button-secondary" data-act="cancel">Cancel</button>
       <button type="button" class="button button-primary" data-act="add">Add Selected</button>
-    </div>` : `
-    <h3 class="dialog-title">Add Schematics</h3>
-    <p class="dialog-message">All of your schematics are already in this project.</p>
-    <div class="dialog-actions">
-      <button type="button" class="button button-secondary" data-act="cancel">Close</button>
     </div>`);
 
-  pop.querySelector('[data-act="cancel"]')?.addEventListener('click', close);
+  const listEl = pop.querySelector('#add-schem-list');
+  const moreEl = pop.querySelector('#add-schem-more');
   const search = pop.querySelector('#add-schem-search');
-  search?.addEventListener('input', () => {
-    const term = search.value.trim().toLowerCase();
-    pop.querySelectorAll('.add-schem-item').forEach(el => {
-      el.hidden = term && !el.dataset.name.includes(term);
-    });
-  });
-  search?.focus();
+  const selected = new Set();
+  let reqController = null;
 
-  pop.querySelector('[data-act="add"]')?.addEventListener('click', async () => {
-    const selected = Array.from(pop.querySelectorAll('#add-schem-list input:checked')).map(i => i.value);
-    if (!selected.length) { close(); return; }
-    const ids = items.map(m => m.id).concat(selected);
+  listEl.addEventListener('change', e => {
+    const input = e.target.closest('input[type="checkbox"]');
+    if (!input) return;
+    if (input.checked) selected.add(input.value);
+    else selected.delete(input.value);
+  });
+
+  function renderCandidates() {
+    listEl.innerHTML = mine.length
+      ? mine.map(m => `<label class="add-schem-item">
+        <input type="checkbox" value="${esc(m.id)}"${selected.has(m.id) ? ' checked' : ''} />
+        <span>${esc(m.name)}</span>
+      </label>`).join('')
+      : '<span class="form-hint">No matching schematics.</span>';
+    if (offset < total) {
+      moreEl.innerHTML = '<button type="button" class="button button-secondary button-sm" id="add-schem-more-btn">Load more</button>';
+      moreEl.querySelector('#add-schem-more-btn').addEventListener('click', () => loadCandidates(false));
+    } else {
+      moreEl.innerHTML = mine.length ? `<span class="list-status">Showing all ${mine.length} available schematic${mine.length === 1 ? '' : 's'}</span>` : '';
+    }
+  }
+
+  async function loadCandidates(reset) {
+    // Abort any in-flight page so a new search can't be dropped and stale
+    // results can't render under the updated query.
+    if (reqController) reqController.abort();
+    const controller = new AbortController();
+    reqController = controller;
+    if (reset) { mine = []; total = 0; offset = 0; }
+    if (reset) {
+      listEl.innerHTML = '<span class="form-hint">Loading...</span>';
+      moreEl.innerHTML = '';
+    }
+    try {
+      const data = await API.list({ owner: 'me', q: query, limit: pageSize, offset }, controller.signal);
+      if (controller.signal.aborted || isStale(signal)) return;
+      total = data.total || 0;
+      const page = data.items || [];
+      offset += page.length;
+      mine = mine.concat(page.filter(m => !existing.has(m.id)));
+      renderCandidates();
+    } catch (err) {
+      if (err.name === 'AbortError' || controller.signal.aborted || isStale(signal)) return;
+      listEl.innerHTML = '<span class="form-hint" style="color:#ef4444">Failed to load your schematics.</span>';
+    }
+  }
+
+  const debounce = fn => {
+    let timer;
+    return () => { clearTimeout(timer); timer = setTimeout(fn, 280); };
+  };
+  search.addEventListener('input', debounce(() => { query = search.value.trim(); loadCandidates(true); }));
+  search.focus();
+
+  pop.querySelector('[data-act="cancel"]').addEventListener('click', close);
+  pop.querySelector('[data-act="add"]').addEventListener('click', async () => {
+    const signal = routeSignal();
+    const chosen = Array.from(selected);
+    if (!chosen.length) { close(); return; }
+    const ids = items.map(m => m.id).concat(chosen);
     const btn = pop.querySelector('[data-act="add"]');
     btn.disabled = true;
     btn.textContent = 'Adding...';
     try {
       const updated = await API.setProjectSchematics(projectId, ids);
+      close();
+      if (isStale(signal)) return;
       items.length = 0;
       items.push(...(updated.schematics || []));
       renderProjectSchematics(items, true, projectId);
       toast('Schematics added');
-      close();
     } catch (err) {
+      if (isStale(signal)) return;
       toast(err.message || 'Failed to add schematics', 'error');
       btn.disabled = false;
       btn.textContent = 'Add Selected';
     }
   });
+
+  await loadCandidates(true);
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -1866,15 +2040,18 @@ async function renderAdmin() {
     $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Not found</h2></div>';
     return;
   }
+  const signal = routeSignal();
   $view.innerHTML = '<div class="panel fade-in"><div class="empty-state"><p class="empty-text">Loading...</p></div></div>';
 
   let users;
   try {
-    users = (await API.adminUsers()).items || [];
+    users = (await API.adminUsers(signal)).items || [];
   } catch {
+    if (isStale(signal)) return;
     $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">Failed to load users</h2></div>';
     return;
   }
+  if (isStale(signal)) return;
 
   $view.innerHTML = `
     <div class="fade-in admin-view">
@@ -1886,27 +2063,32 @@ async function renderAdmin() {
 
   $view.querySelectorAll('[data-admin-action]').forEach(btn => {
     btn.addEventListener('click', async e => {
+      const signal = routeSignal();
       const el = e.currentTarget;
       const user = users.find(u => u.id === el.dataset.userId);
       if (!user) return;
       try {
         if (el.dataset.adminAction === 'delete') {
           const ok = await confirm(el, 'Delete User', `Delete "${user.username}" and all of their uploads? This cannot be undone.`);
-          if (!ok) return;
+          if (!ok || isStale(signal)) return;
           await API.adminDeleteUser(user.id);
+          invalidateList();
+          if (isStale(signal)) return;
           toast('User deleted');
         } else if (el.dataset.adminAction === 'promote') {
           await API.adminUpdateUser(user.id, { isAdmin: !user.isAdmin });
+          if (isStale(signal)) return;
           toast(user.isAdmin ? 'Admin access revoked' : 'Admin access granted');
         } else if (el.dataset.adminAction === 'password') {
           const pw = window.prompt(`New password for ${user.username} (8-72 characters)`);
-          if (!pw) return;
+          if (!pw || isStale(signal)) return;
           await API.adminUpdateUser(user.id, { password: pw });
+          if (isStale(signal)) return;
           toast('Password updated');
         }
         renderAdmin();
       } catch (err) {
-        toast(err.message || 'Action failed', 'error');
+        if (!isStale(signal)) toast(err.message || 'Action failed', 'error');
       }
     });
   });
@@ -1930,13 +2112,16 @@ function adminUserRowHtml(u) {
 }
 
 async function renderProfile(username) {
+  const signal = routeSignal();
   $view.innerHTML = '<div class="panel fade-in"><div class="empty-state"><p class="empty-text">Loading...</p></div></div>';
 
   let profile;
-  try { profile = await API.profile(username); } catch {
+  try { profile = await API.profile(username, signal); } catch {
+    if (isStale(signal)) return;
     $view.innerHTML = '<div class="panel fade-in"><h2 class="page-title">User not found</h2><a href="#/" class="button button-secondary">Back to schematics</a></div>';
     return;
   }
+  if (isStale(signal)) return;
 
   const { user, stats, best, latest } = profile;
   const isSelf = !!currentUser && currentUser.id === user.id;
@@ -2016,6 +2201,7 @@ function openProfileEditPopover(anchor, user) {
   pop.querySelector('[data-act="cancel"]').addEventListener('click', close);
   pop.querySelector('#profile-edit-form').addEventListener('submit', async e => {
     e.preventDefault();
+    const signal = routeSignal();
     const btn = pop.querySelector('[data-act="save"]');
     const newPassword = pop.querySelector('#pop-profile-new').value;
     const body = {
@@ -2031,12 +2217,15 @@ function openProfileEditPopover(anchor, user) {
     try {
       const updated = await API.updateMe(body);
       currentUser = updated;
-      renderAuthNav();
-      toast('Profile updated');
+      invalidateList();
       close();
+      renderAuthNav();
+      if (isStale(signal)) return;
+      toast('Profile updated');
       if (updated.username !== user.username) location.hash = '#/user/' + encodeURIComponent(updated.username);
       else renderProfile(updated.username);
     } catch (err) {
+      if (isStale(signal)) return;
       toast(err.message || 'Update failed', 'error');
       btn.disabled = false;
       btn.textContent = 'Save Changes';
@@ -2076,6 +2265,7 @@ function renderAuth() {
 
   document.getElementById('auth-form').addEventListener('submit', async e => {
     e.preventDefault();
+    const signal = routeSignal();
     const btn = document.getElementById('auth-btn');
     const errEl = document.getElementById('auth-error');
     errEl.hidden = true;
@@ -2088,9 +2278,11 @@ function renderAuth() {
       );
       currentUser = user;
       renderAuthNav();
+      if (isStale(signal)) return;
       toast(created ? 'Account created' : 'Welcome back, ' + user.username);
       location.hash = '#/';
     } catch (err) {
+      if (isStale(signal)) return;
       errEl.textContent = err.message || 'Authentication failed';
       errEl.hidden = false;
       btn.disabled = false;

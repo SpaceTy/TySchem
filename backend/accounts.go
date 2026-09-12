@@ -201,8 +201,87 @@ func (s *Store) UpdateUser(id string, username, bio *string) (User, error) {
 	return s.GetUser(id)
 }
 
+// UpdateAccount atomically applies optional username/bio changes together with
+// an optional password change. All input is validated before anything is
+// written, so a rejected username or bio can never leave a changed password.
+// When newPassword is non-empty, currentPassword must match; the password
+// change revokes every existing session for the account. passwordChanged
+// reports whether the hash was replaced so the caller can re-issue a session.
+func (s *Store) UpdateAccount(id string, username, bio *string, currentPassword, newPassword string) (User, bool, error) {
+	if !validID(id) {
+		return User{}, false, ErrUnauthorized
+	}
+	var sets []string
+	var args []any
+	if username != nil {
+		name := strings.TrimSpace(*username)
+		if !validUsername(name) {
+			return User{}, false, fmt.Errorf("username must be %d-%d characters (letters, digits, _ or -)", usernameMinLen, usernameMaxLen)
+		}
+		sets = append(sets, "username = ?")
+		args = append(args, name)
+	}
+	if bio != nil {
+		b := strings.TrimSpace(*bio)
+		if len(b) > bioMaxLen {
+			return User{}, false, fmt.Errorf("bio must be <= %d characters", bioMaxLen)
+		}
+		sets = append(sets, "bio = ?")
+		args = append(args, b)
+	}
+
+	passwordChanged := newPassword != ""
+	if passwordChanged {
+		if len(newPassword) < passwordMinLen || len(newPassword) > passwordMaxLen {
+			return User{}, false, fmt.Errorf("password must be %d-%d characters", passwordMinLen, passwordMaxLen)
+		}
+		current, err := s.GetUser(id)
+		if err != nil {
+			return User{}, false, err
+		}
+		if bcrypt.CompareHashAndPassword([]byte(current.PasswordHash), []byte(currentPassword)) != nil {
+			return User{}, false, ErrInvalidLogin
+		}
+		hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+		if err != nil {
+			return User{}, false, err
+		}
+		sets = append(sets, "password_hash = ?")
+		args = append(args, string(hash))
+	}
+
+	if len(sets) == 0 {
+		u, err := s.GetUser(id)
+		return u, false, err
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return User{}, false, err
+	}
+	defer tx.Rollback()
+	args = append(args, id)
+	if _, err := tx.Exec(`UPDATE users SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
+		if isUniqueViolation(err) {
+			return User{}, false, ErrUserExists
+		}
+		return User{}, false, err
+	}
+	if passwordChanged {
+		if _, err := tx.Exec(`DELETE FROM sessions WHERE user_id = ?`, id); err != nil {
+			return User{}, false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return User{}, false, err
+	}
+	u, err := s.GetUser(id)
+	return u, passwordChanged, err
+}
+
 // ChangePassword verifies currentPassword and replaces the hash with one for
-// newPassword. A wrong current password yields ErrInvalidLogin.
+// newPassword. A wrong current password yields ErrInvalidLogin. All existing
+// sessions are revoked so a stolen or stale session cannot survive the change.
 func (s *Store) ChangePassword(id, currentPassword, newPassword string) error {
 	u, err := s.GetUser(id)
 	if err != nil {
@@ -218,8 +297,18 @@ func (s *Store) ChangePassword(id, currentPassword, newPassword string) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE users SET password_hash = ? WHERE id = ?`, string(hash), id)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE users SET password_hash = ? WHERE id = ?`, string(hash), id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM sessions WHERE user_id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Authenticate verifies a username/password pair, returning a generic error
@@ -344,6 +433,9 @@ func (s *Store) EnsureAdmin(username, password string) (User, error) {
 	case err != nil:
 		return User{}, err
 	default:
+		// Provisioning an existing account must not let a session created
+		// before provisioning inherit the reset password or admin flag.
+		changed := false
 		if bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)) != nil {
 			hash, herr := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 			if herr != nil {
@@ -352,7 +444,21 @@ func (s *Store) EnsureAdmin(username, password string) (User, error) {
 			if _, herr := s.db.Exec(`UPDATE users SET password_hash = ? WHERE id = ?`, string(hash), u.ID); herr != nil {
 				return User{}, herr
 			}
+			changed = true
 		}
+		if !u.IsAdmin {
+			if err := s.SetAdmin(u.ID, true); err != nil {
+				return User{}, err
+			}
+			u.IsAdmin = true
+			changed = true
+		}
+		if changed {
+			if _, err := s.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, u.ID); err != nil {
+				return User{}, err
+			}
+		}
+		return u, nil
 	}
 	if !u.IsAdmin {
 		if err := s.SetAdmin(u.ID, true); err != nil {
@@ -374,6 +480,7 @@ func (s *Store) SetAdmin(id string, admin bool) error {
 
 // SetPassword replaces an account's password without checking the old one.
 // Intended for administrator resets; callers must already be authorized.
+// Existing sessions are revoked so the reset takes effect immediately.
 func (s *Store) SetPassword(id, password string) error {
 	if !validID(id) {
 		return ErrUnauthorized
@@ -385,8 +492,18 @@ func (s *Store) SetPassword(id, password string) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE users SET password_hash = ? WHERE id = ?`, string(hash), id)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE users SET password_hash = ? WHERE id = ?`, string(hash), id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM sessions WHERE user_id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ListUsers returns every account ordered case-insensitively by username.
