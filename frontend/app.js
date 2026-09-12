@@ -2407,9 +2407,33 @@ function renderAuth() {
 }
 
 // ───────────────────────────────────────────────────────────────
+//  Phone gate
+// ───────────────────────────────────────────────────────────────
+function isPhone() {
+  const ua = navigator.userAgent || '';
+  if (/iPhone|iPod|Android.*Mobile|Windows Phone|webOS|BlackBerry|Opera Mini|IEMobile/i.test(ua)) return true;
+  if (navigator.userAgentData && navigator.userAgentData.mobile) return true;
+  return false;
+}
+
+function showMobileGate() {
+  document.body.classList.add('mobile-only');
+  const gate = document.createElement('div');
+  gate.className = 'mobile-gate';
+  gate.innerHTML =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+      '<rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8M12 18v3"/>' +
+    '</svg>' +
+    '<h1>Desktop Only</h1>' +
+    '<p>TySchem only works on computers. Please open this page on a desktop or laptop to continue.</p>';
+  document.body.appendChild(gate);
+}
+
+// ───────────────────────────────────────────────────────────────
 //  Boot
 // ───────────────────────────────────────────────────────────────
 (async function boot() {
+  if (isPhone()) { showMobileGate(); return; }
   await refreshAuth();
   route();
 })();
