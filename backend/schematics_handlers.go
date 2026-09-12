@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,14 @@ import (
 
 // MaxUploadSize caps a single .litematic upload (50 MiB).
 const MaxUploadSize = 50 << 20
+
+// MaxPreviewSize caps the optional webp card thumbnail (2 MiB).
+const MaxPreviewSize = 2 << 20
+
+// isWebP reports whether b starts with the RIFF/WEBP container signature.
+func isWebP(b []byte) bool {
+	return len(b) >= 12 && string(b[0:4]) == "RIFF" && string(b[8:12]) == "WEBP"
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -83,6 +92,8 @@ func registerSchematicRoutes(mux *http.ServeMux, store *Store) {
 				return
 			}
 			handleSchematicFile(w, r, store, id)
+		case "preview":
+			handleSchematicPreview(w, r, store, id)
 		case "rating":
 			user, ok := requireUser(w, r, store)
 			if !ok {
@@ -102,9 +113,10 @@ func registerSchematicRoutes(mux *http.ServeMux, store *Store) {
 }
 
 // POST /api/schematics (multipart/form-data, authenticated)
-// Fields: file (required, *.litematic), name (optional), description (optional).
+// Fields: file (required, *.litematic), name (optional), description (optional),
+// preview (optional, webp card thumbnail).
 func handleSchematicUpload(w http.ResponseWriter, r *http.Request, store *Store, user User) {
-	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadSize+10<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, MaxUploadSize+MaxPreviewSize+10<<20)
 	if err := r.ParseMultipartForm(MaxUploadSize); err != nil {
 		writeErr(w, http.StatusBadRequest, "failed to parse multipart form (max 50 MiB): "+err.Error())
 		return
@@ -156,7 +168,29 @@ func handleSchematicUpload(w http.ResponseWriter, r *http.Request, store *Store,
 		return
 	}
 
-	meta, err := store.Create(user.ID, name, description, origName, data)
+	// Optional webp thumbnail rendered by the client for the browse cards.
+	var preview []byte
+	if pf, _, ferr := r.FormFile("preview"); ferr == nil {
+		defer pf.Close()
+		preview, err = io.ReadAll(io.LimitReader(pf, MaxPreviewSize+1))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "failed to read preview: "+err.Error())
+			return
+		}
+		if len(preview) > MaxPreviewSize {
+			writeErr(w, http.StatusRequestEntityTooLarge, "preview exceeds 2 MiB limit")
+			return
+		}
+		if !isWebP(preview) {
+			writeErr(w, http.StatusBadRequest, "preview must be a webp image")
+			return
+		}
+	} else if !errors.Is(ferr, http.ErrMissingFile) {
+		writeErr(w, http.StatusBadRequest, "invalid preview field")
+		return
+	}
+
+	meta, err := store.Create(user.ID, name, description, origName, data, preview)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to store schematic")
 		return
@@ -388,6 +422,64 @@ func handleSchematicFile(w http.ResponseWriter, r *http.Request, store *Store, i
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename=%q`, meta.FileName))
 	http.ServeFile(w, r, path)
+}
+
+// GET /api/schematics/{id}/preview — stored webp card thumbnail (public).
+// PUT/POST /api/schematics/{id}/preview — cache a client-rendered webp thumbnail
+// (admins only, used to backfill previews for pre-existing schematics).
+func handleSchematicPreview(w http.ResponseWriter, r *http.Request, store *Store, id string) {
+	switch r.Method {
+	case http.MethodGet:
+		meta, err := store.Get(id)
+		if err != nil || !meta.HasPreview {
+			writeErr(w, http.StatusNotFound, "preview not found")
+			return
+		}
+		path := store.PreviewPath(id)
+		if _, err := os.Stat(path); err != nil {
+			writeErr(w, http.StatusNotFound, "preview not found")
+			return
+		}
+		w.Header().Set("Content-Type", "image/webp")
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		http.ServeFile(w, r, path)
+	case http.MethodPut, http.MethodPost:
+		user, ok := requireUser(w, r, store)
+		if !ok {
+			return
+		}
+		if !user.IsAdmin {
+			writeErr(w, http.StatusForbidden, "admin access required")
+			return
+		}
+		if _, err := store.Get(id); err != nil {
+			writeErr(w, http.StatusNotFound, "schematic not found")
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, MaxPreviewSize)
+		data, err := io.ReadAll(io.LimitReader(r.Body, MaxPreviewSize+1))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "failed to read preview: "+err.Error())
+			return
+		}
+		if len(data) > MaxPreviewSize {
+			writeErr(w, http.StatusRequestEntityTooLarge, "preview exceeds 2 MiB limit")
+			return
+		}
+		if !isWebP(data) {
+			writeErr(w, http.StatusBadRequest, "preview must be a webp image")
+			return
+		}
+		meta, err := store.SetPreview(id, data)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "schematic not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, meta)
+	default:
+		w.Header().Set("Allow", "GET, PUT, POST")
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
 }
 
 // PUT/PATCH /api/schematics/{id} — JSON {"name"?,"description"?} updates metadata (owner only).

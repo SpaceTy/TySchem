@@ -66,6 +66,17 @@ const API = {
     return feedbackRequest('/api/schematics/' + id + '/like', { method: 'POST' });
   },
   downloadUrl(id) { return '/api/schematics/' + id + '/file'; },
+  previewUrl(id) { return '/api/schematics/' + id + '/preview'; },
+  // Admins cache a client-rendered webp thumbnail for schematics lacking one.
+  async setPreview(id, blob) {
+    const r = await fetch('/api/schematics/' + id + '/preview', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'image/webp' },
+      body: blob,
+    });
+    if (!r.ok) throw new Error('preview upload failed');
+    return r.json();
+  },
   // One call for both login and sign-up: the server decides based on whether
   // the username already exists.
   async enter(username, password) {
@@ -482,13 +493,25 @@ const _thumbPending = new Map();   // id -> [imgEl, ...] queued/rendering
 const _thumbQueue = [];
 let _thumbRunning = false;
 
-function requestThumbnail(id, imgEl) {
+function requestThumbnail(id, imgEl, hasPreview) {
   if (!id || !imgEl) return;
+  // Prefer the webp thumbnail rendered at upload time; fall back to
+  // client-side rendering only when the server has none or serving fails.
+  if (hasPreview) {
+    imgEl.addEventListener('load', () => imgEl.closest('.card-thumb')?.classList.add('thumb-ready'), { once: true });
+    imgEl.addEventListener('error', () => requestRenderedThumbnail(id, imgEl, false), { once: true });
+    imgEl.src = API.previewUrl(id);
+    return;
+  }
+  requestRenderedThumbnail(id, imgEl, true);
+}
+
+function requestRenderedThumbnail(id, imgEl, cachePreview) {
   if (_thumbCache.has(id)) { setThumb(imgEl, _thumbCache.get(id)); return; }
   const waiters = _thumbPending.get(id);
   if (waiters) { waiters.push(imgEl); return; }
   _thumbPending.set(id, [imgEl]);
-  _thumbQueue.push({ id });
+  _thumbQueue.push({ id, cachePreview });
   pumpThumbQueue();
 }
 
@@ -499,7 +522,7 @@ async function pumpThumbQueue() {
     const job = _thumbQueue.shift();
     const waiters = _thumbPending.get(job.id) || [];
     try {
-      const url = _thumbCache.get(job.id) || await renderThumbnail(job.id);
+      const url = _thumbCache.get(job.id) || await renderThumbnail(job.id, job.cachePreview);
       _thumbCache.set(job.id, url);
       for (const el of waiters) { if (el.isConnected) setThumb(el, url); }
     } catch (err) {
@@ -518,8 +541,7 @@ function setThumb(imgEl, url) {
   imgEl.closest('.card-thumb')?.classList.add('thumb-ready');
 }
 
-async function renderThumbnail(id) {
-  const [structure, resources] = await Promise.all([loadStructure(id), loadPack()]);
+async function renderStructureToCanvas(structure, resources) {
   const width = 280;
   const height = 280;   // square to match the compact .card-thumb
   const canvas = document.createElement('canvas');
@@ -536,10 +558,50 @@ async function renderThumbnail(id) {
     renderer.setViewport(0, 0, width, height, 1);
     renderer.setCamera(orbitCamera(structure, Math.PI * 0.28, Math.PI * 0.36, 1.8));
     renderer.drawStructure();
-    return canvas.toDataURL('image/png');
+    return canvas;
   } finally {
     renderer.dispose();
   }
+}
+
+async function renderThumbnail(id, cachePreview) {
+  const [structure, resources] = await Promise.all([loadStructure(id), loadPack()]);
+  const canvas = await renderStructureToCanvas(structure, resources);
+  if (cachePreview) cacheRenderedPreview(id, canvas);
+  return canvas.toDataURL('image/png');
+}
+
+// Admins backfill a stored webp preview whenever the frontend has to render a
+// schematic that has none, so old schematics get cached for everyone else.
+const _previewUploaded = new Set();
+function cacheRenderedPreview(id, canvas) {
+  if (!currentUser || !currentUser.isAdmin) return;
+  if (_previewUploaded.has(id)) return;
+  _previewUploaded.add(id);
+  canvas.toBlob(blob => {
+    if (!blob || blob.type !== 'image/webp') { _previewUploaded.delete(id); return; }
+    API.setPreview(id, blob).then(() => {
+      document.querySelectorAll('.schematic-card[data-id="' + id + '"]').forEach(c => { c.dataset.hasPreview = '1'; });
+      const item = _listItems.find(x => x.id === id);
+      if (item) item.hasPreview = true;
+    }).catch(err => {
+      _previewUploaded.delete(id);
+      console.warn('[tyschem] failed to cache preview for', id, err);
+    });
+  }, 'image/webp', 0.9);
+}
+
+// Renders a just-chosen file so the upload page can show the same preview the
+// browse cards use, and for the backend to store as a webp thumbnail.
+async function renderFilePreview(file) {
+  const [structure, resources] = await Promise.all([
+    file.arrayBuffer().then(buf => LODESTONE.LitematicLoader.load(new Uint8Array(buf))),
+    loadPack(),
+  ]);
+  const canvas = await renderStructureToCanvas(structure, resources);
+  const dataUrl = canvas.toDataURL('image/png');
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/webp', 0.9));
+  return { dataUrl, blob };
 }
 
 // Only queue thumbnails once their card scrolls near the viewport.
@@ -551,7 +613,7 @@ function thumbObserver() {
         if (!e.isIntersecting) continue;
         _thumbObserver.unobserve(e.target);
         const img = e.target.querySelector('.card-thumb-img');
-        requestThumbnail(e.target.dataset.id, img);
+        requestThumbnail(e.target.dataset.id, img, e.target.dataset.hasPreview === '1');
       }
     }, { rootMargin: '250px' });
   }
@@ -1032,7 +1094,7 @@ function openOrderPopover(anchor) {
 
 function cardHtml(m) {
   return `
-    <div class="schematic-card" data-id="${m.id}" data-href="#/schematic/${m.id}" tabindex="0">
+    <div class="schematic-card" data-id="${m.id}" data-has-preview="${m.hasPreview ? '1' : '0'}" data-href="#/schematic/${m.id}" tabindex="0">
       <div class="card-head">
         <div class="card-thumb">
           <img class="card-thumb-img" alt="Preview of ${esc(m.name)}" />
@@ -1151,12 +1213,16 @@ function mountListCards(cards) {
       onLikeClick(e.currentTarget, card.dataset.id);
     });
   }
-  if (previewsSupported()) {
-    const obs = thumbObserver();
-    cards.forEach(card => obs.observe(card));
-  } else {
-    cards.forEach(card => card.querySelector('.card-thumb')?.classList.add('thumb-error'));
-  }
+  const obs = thumbObserver();
+  const supported = previewsSupported();
+  cards.forEach(card => {
+    // Stored webp previews are plain images, so they work without WebGL.
+    if (!supported && card.dataset.hasPreview !== '1') {
+      card.querySelector('.card-thumb')?.classList.add('thumb-error');
+      return;
+    }
+    obs.observe(card);
+  });
 }
 
 function setListStatus(kind, text = '') {
@@ -1276,6 +1342,13 @@ async function renderUpload() {
               <span class="upload-file-icon">&#128206;</span>
               <span class="upload-file-text" id="file-text">No file selected &middot; drag &amp; drop here or use the upload button &middot; max 50 MiB</span>
             </div>
+            <div class="upload-preview" id="upload-preview" hidden>
+              <div class="card-thumb upload-preview-thumb">
+                <img class="card-thumb-img" id="upload-preview-img" alt="Schematic preview" />
+                <div class="card-thumb-loading"></div>
+              </div>
+              <div class="upload-preview-hint" id="upload-preview-hint">Rendering preview&hellip;</div>
+            </div>
             <div id="upload-progress-wrap" style="display:none">
               <div class="upload-progress"><div class="upload-progress-bar" id="upload-bar" style="width:0%"></div></div>
             </div>
@@ -1291,6 +1364,45 @@ async function renderUpload() {
   const fileBar = document.getElementById('upload-file');
   const text   = document.getElementById('file-text');
   let chosenFile = null;
+  let previewBlob = null;
+
+  function clearPreview() {
+    previewBlob = null;
+    const box = document.getElementById('upload-preview');
+    const img = document.getElementById('upload-preview-img');
+    if (!box) return;
+    box.hidden = true;
+    box.classList.remove('upload-preview-error');
+    box.querySelector('.card-thumb')?.classList.remove('thumb-ready');
+    if (img) img.removeAttribute('src');
+  }
+
+  async function renderUploadPreview(f) {
+    if (!previewsSupported()) { clearPreview(); return; }
+    const box = document.getElementById('upload-preview');
+    const img = document.getElementById('upload-preview-img');
+    const hint = document.getElementById('upload-preview-hint');
+    if (!box || !img || !hint) return;
+    box.hidden = false;
+    box.classList.remove('upload-preview-error');
+    box.querySelector('.card-thumb')?.classList.remove('thumb-ready');
+    hint.textContent = 'Rendering preview\u2026';
+    try {
+      const { dataUrl, blob } = await renderFilePreview(f);
+      if (chosenFile !== f) return;   // selection changed while rendering
+      if (blob && blob.type === 'image/webp') previewBlob = blob;
+      img.src = dataUrl;
+      img.closest('.card-thumb')?.classList.add('thumb-ready');
+      hint.textContent = previewBlob
+        ? 'Preview ready \u00b7 shown on the browse page.'
+        : 'Preview ready \u00b7 this browser cannot encode webp, so it will not be stored.';
+    } catch (err) {
+      if (chosenFile !== f) return;
+      console.warn('[tyschem] upload preview failed', err);
+      box.classList.add('upload-preview-error');
+      hint.textContent = 'Could not render a preview for this file.';
+    }
+  }
 
   function setFile(f) {
     chosenFile = f;
@@ -1299,11 +1411,13 @@ async function renderUpload() {
       text.innerHTML = `<strong>${esc(f.name)}</strong> &middot; ${fmtBytes(f.size)}`;
       btn.title = 'Upload';
       btn.setAttribute('aria-label', 'Upload');
+      renderUploadPreview(f);
     } else {
       fileBar.classList.remove('has-file');
       text.innerHTML = 'No file selected &middot; drag &amp; drop here or use the upload button &middot; max 50 MiB';
       btn.title = 'Choose a .litematic file';
       btn.setAttribute('aria-label', 'Choose a .litematic file');
+      clearPreview();
     }
   }
 
@@ -1369,6 +1483,7 @@ async function renderUpload() {
     fd.append('file', chosenFile);
     fd.append('name', document.getElementById('upload-name').value.trim());
     fd.append('description', document.getElementById('upload-desc').value.trim());
+    if (previewBlob) fd.append('preview', previewBlob, 'preview.webp');
 
     try {
       const meta = await API.upload(fd, p => { bar.style.width = Math.round(p * 100) + '%'; });

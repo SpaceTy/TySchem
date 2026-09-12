@@ -24,6 +24,7 @@ type SchematicMetadata struct {
 	FileName    string    `json:"fileName"` // original upload filename
 	Size        int64     `json:"size"`     // bytes on disk
 	ContentType string    `json:"contentType"`
+	HasPreview  bool      `json:"hasPreview"`          // a webp card thumbnail is stored
 	OwnerID     string    `json:"ownerId,omitempty"`   // empty for legacy/anonymous uploads
 	OwnerName   string    `json:"ownerName,omitempty"` // joined from users
 	UploadDate  time.Time `json:"uploadDate"`
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS schematics (
 	file_name    TEXT NOT NULL,
 	size         INTEGER NOT NULL,
 	content_type TEXT NOT NULL,
+	has_preview  INTEGER NOT NULL DEFAULT 0,
 	owner_id     TEXT,
 	upload_date  TEXT NOT NULL,
 	updated_date TEXT NOT NULL
@@ -127,6 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_project_schematics_schematic ON project_schematic
 // Store persists schematic blobs on disk and their metadata in SQLite:
 //
 //	<dataDir>/files/<id>.litematic   (blobs)
+//	<dataDir>/files/<id>.webp        (optional card thumbnails)
 //	<dataDir>/schematics.db          (metadata index)
 //
 // Listing / filtering goes through the SQLite metadata index,
@@ -173,6 +176,11 @@ func NewStore(dataDir string) (*Store, error) {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_schematics_owner ON schematics(owner_id)`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("index schematics.owner_id: %w", err)
+	}
+	// Migration: databases created before stored card previews lack has_preview.
+	if err := s.ensureColumn("schematics", "has_preview", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate schematics.has_preview: %w", err)
 	}
 	// Migration: databases created before profiles existed lack users.bio.
 	if err := s.ensureColumn("users", "bio", "TEXT NOT NULL DEFAULT ''"); err != nil {
@@ -222,6 +230,11 @@ func (s *Store) Close() error {
 
 func (s *Store) FilePath(id string) string {
 	return filepath.Join(s.filesDir, id+".litematic")
+}
+
+// PreviewPath is the location of the optional webp card thumbnail.
+func (s *Store) PreviewPath(id string) string {
+	return filepath.Join(s.filesDir, id+".webp")
 }
 
 var ErrNotFound = errors.New("schematic not found")
@@ -281,10 +294,10 @@ func scanMetadata(row interface {
 	var m SchematicMetadata
 	var uploadDate, updatedDate string
 	var ownerID, ownerName sql.NullString
-	var liked int
+	var liked, hasPreview int
 	if err := row.Scan(
 		&m.ID, &m.Name, &m.Description, &m.FileName,
-		&m.Size, &m.ContentType, &uploadDate, &updatedDate,
+		&m.Size, &m.ContentType, &hasPreview, &uploadDate, &updatedDate,
 		&ownerID, &ownerName,
 		&m.AvgRating, &m.RatingCount, &m.LikeCount, &m.UserRating, &liked,
 	); err != nil {
@@ -296,6 +309,7 @@ func scanMetadata(row interface {
 	m.OwnerID = ownerID.String
 	m.OwnerName = ownerName.String
 	m.Liked = liked != 0
+	m.HasPreview = hasPreview != 0
 	var err error
 	if m.UploadDate, err = parseTime(uploadDate); err != nil {
 		return SchematicMetadata{}, err
@@ -310,7 +324,7 @@ func scanMetadata(row interface {
 // for the viewer's rating, once for their like) and must be passed first in
 // the query args, before any WHERE args, because the subqueries precede WHERE.
 func metaColumns(viewerID string) string {
-	return "s.id, s.name, s.description, s.file_name, s.size, s.content_type, s.upload_date, s.updated_date, s.owner_id, u.username, " +
+	return "s.id, s.name, s.description, s.file_name, s.size, s.content_type, s.has_preview, s.upload_date, s.updated_date, s.owner_id, u.username, " +
 		`COALESCE((SELECT AVG(r.rating) FROM ratings r WHERE r.schematic_id = s.id), 0), ` +
 		`COALESCE((SELECT COUNT(*) FROM ratings r WHERE r.schematic_id = s.id), 0), ` +
 		`COALESCE((SELECT COUNT(*) FROM likes l WHERE l.schematic_id = s.id), 0), ` +
@@ -321,7 +335,8 @@ func metaColumns(viewerID string) string {
 const metaFrom = "FROM schematics s LEFT JOIN users u ON u.id = s.owner_id"
 
 // Create stores a new schematic blob + metadata row owned by ownerID.
-func (s *Store) Create(ownerID, name, description, fileName string, data []byte) (SchematicMetadata, error) {
+// preview is an optional webp card thumbnail; empty means none.
+func (s *Store) Create(ownerID, name, description, fileName string, data, preview []byte) (SchematicMetadata, error) {
 	id := newID()
 	now := time.Now().UTC()
 	meta := SchematicMetadata{
@@ -331,6 +346,7 @@ func (s *Store) Create(ownerID, name, description, fileName string, data []byte)
 		FileName:    fileName,
 		Size:        int64(len(data)),
 		ContentType: "application/octet-stream",
+		HasPreview:  len(preview) > 0,
 		OwnerID:     ownerID,
 		UploadDate:  now,
 		UpdatedDate: now,
@@ -339,15 +355,22 @@ func (s *Store) Create(ownerID, name, description, fileName string, data []byte)
 	if err := os.WriteFile(s.FilePath(id), data, 0o644); err != nil {
 		return SchematicMetadata{}, err
 	}
+	if meta.HasPreview {
+		if err := os.WriteFile(s.PreviewPath(id), preview, 0o644); err != nil {
+			os.Remove(s.FilePath(id))
+			return SchematicMetadata{}, err
+		}
+	}
 	_, err := s.db.Exec(
-		`INSERT INTO schematics (id, name, description, file_name, size, content_type, owner_id, upload_date, updated_date)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO schematics (id, name, description, file_name, size, content_type, has_preview, owner_id, upload_date, updated_date)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		meta.ID, meta.Name, meta.Description, meta.FileName,
-		meta.Size, meta.ContentType, nullIfEmpty(meta.OwnerID),
+		meta.Size, meta.ContentType, boolToInt(meta.HasPreview), nullIfEmpty(meta.OwnerID),
 		formatTime(meta.UploadDate), formatTime(meta.UpdatedDate),
 	)
 	if err != nil {
 		os.Remove(s.FilePath(id))
+		os.Remove(s.PreviewPath(id))
 		return SchematicMetadata{}, err
 	}
 	return meta, nil
@@ -391,6 +414,33 @@ func nullIfEmpty(s string) any {
 	return s
 }
 
+// SetPreview replaces a schematic's webp card thumbnail, creating it if absent.
+// It does not touch updated_date: the preview is a cache, not content.
+func (s *Store) SetPreview(id string, preview []byte) (SchematicMetadata, error) {
+	if !validID(id) || len(preview) == 0 {
+		return SchematicMetadata{}, ErrNotFound
+	}
+	path := s.PreviewPath(id)
+	if err := os.WriteFile(path, preview, 0o644); err != nil {
+		return SchematicMetadata{}, err
+	}
+	res, err := s.db.Exec(`UPDATE schematics SET has_preview = 1 WHERE id = ?`, id)
+	if err != nil {
+		os.Remove(path)
+		return SchematicMetadata{}, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		os.Remove(path)
+		return SchematicMetadata{}, err
+	}
+	if n == 0 {
+		os.Remove(path)
+		return SchematicMetadata{}, ErrNotFound
+	}
+	return s.Get(id)
+}
+
 // Update changes name and/or description. Pass nil for fields to leave untouched.
 func (s *Store) Update(id string, name, description *string) (SchematicMetadata, error) {
 	if !validID(id) {
@@ -431,6 +481,9 @@ func (s *Store) Delete(id string) error {
 	}
 	// Remove blob first; keep going even if it is already gone.
 	if err := os.Remove(s.FilePath(id)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(s.PreviewPath(id)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	tx, err := s.db.Begin()
